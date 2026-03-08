@@ -77,18 +77,18 @@ STREAM_FLUSH_BYTES = int(os.getenv("STREAM_FLUSH_BYTES", "8192"))
 STREAM_FLUSH_MS = float(os.getenv("STREAM_FLUSH_MS", "0.006"))
 NONSTREAM_THRESHOLD = int(os.getenv("NONSTREAM_PIPE_THRESHOLD", str(256 * 1024)))
 
-# Conservative pool defaults to reduce transport churn and connection reuse bugs.
-MAX_CONN = int(os.getenv("HTTPX_MAX_CONNECTIONS", "256"))
-MAX_KEEPALIVE = int(os.getenv("HTTPX_MAX_KEEPALIVE", "64"))
-KEEPALIVE_EXPIRY = float(os.getenv("HTTPX_KEEPALIVE_EXPIRY", "20"))
+# Connection pool defaults (aligned with wings production defaults).
+MAX_CONN = int(os.getenv("HTTPX_MAX_CONNECTIONS", "2048"))
+MAX_KEEPALIVE = int(os.getenv("HTTPX_MAX_KEEPALIVE", "256"))
+KEEPALIVE_EXPIRY = float(os.getenv("HTTPX_KEEPALIVE_EXPIRY", "30"))
 
-# HTTP/2 is disabled by default because some upstream engines are more stable on HTTP/1.1.
-HTTP2_ENABLED = os.getenv("HTTP2_ENABLED", "false").lower() == "true"
-H2_MAX_STREAMS = int(os.getenv("HTTP2_MAX_STREAMS", "64"))
+# HTTP/2 enabled by default (aligned with wings production defaults).
+HTTP2_ENABLED = os.getenv("HTTP2_ENABLED", "true").lower() != "false"
+H2_MAX_STREAMS = int(os.getenv("HTTP2_MAX_STREAMS", "128"))
 
-# Retry policy for transient backend errors.
-RETRY_TRIES = int(os.getenv("RETRY_TRIES", "5"))
-RETRY_INTERVAL_MS = int(os.getenv("RETRY_INTERVAL_MS", "300"))
+# Retry policy for transient backend errors (aligned with wings: 3 tries, 100ms interval).
+RETRY_TRIES = int(os.getenv("RETRY_TRIES", "3"))
+RETRY_INTERVAL_MS = int(os.getenv("RETRY_INTERVAL_MS", "100"))
 ENABLE_DELIM_FLUSH = os.getenv("ENABLE_DELIM_FLUSH", "true").lower() != "false"
 
 # Client and per-endpoint timeout tuning.
@@ -127,7 +127,7 @@ LOCAL_PASS_THROUGH_LIMIT = _split_strict(GLOBAL_PASS_THROUGH_LIMIT, WORKERS, WOR
 LOCAL_QUEUE_MAXSIZE = _split_strict(GLOBAL_QUEUE_MAXSIZE, WORKERS, WORKER_INDEX)
 MAX_INFLIGHT = LOCAL_PASS_THROUGH_LIMIT
 QUEUE_MAXSIZE = LOCAL_QUEUE_MAXSIZE
-QUEUE_TIMEOUT = float(os.getenv("QUEUE_TIMEOUT", "30.0"))
+QUEUE_TIMEOUT = float(os.getenv("QUEUE_TIMEOUT", "15.0"))
 
 QUEUE_REJECT_POLICY = os.getenv("QUEUE_REJECT_POLICY", "drop_oldest").lower()
 QUEUE_OVERFLOW_MODE = os.getenv("QUEUE_OVERFLOW_MODE", "block").lower()

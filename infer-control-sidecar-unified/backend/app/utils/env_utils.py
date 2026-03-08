@@ -131,7 +131,10 @@ def get_vllm_distributed_port():
     """
     port = os.getenv('VLLM_DISTRIBUTED_PORT')
     if port:
-        return int(port)
+        try:
+            return int(port)
+        except ValueError:
+            logger.warning("Invalid VLLM_DISTRIBUTED_PORT value %r, ignoring", port)
     return None
 
 
@@ -143,7 +146,10 @@ def get_sglang_distributed_port():
     """
     port = os.getenv('SGLANG_DISTRIBUTED_PORT')
     if port:
-        return int(port)
+        try:
+            return int(port)
+        except ValueError:
+            logger.warning("Invalid SGLANG_DISTRIBUTED_PORT value %r, ignoring", port)
     return None
 
 

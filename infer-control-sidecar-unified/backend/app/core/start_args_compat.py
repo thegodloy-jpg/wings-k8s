@@ -183,9 +183,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input-length", type=int, default=_env_int("INPUT_LENGTH", 4096))
     p.add_argument("--output-length", type=int, default=_env_int("OUTPUT_LENGTH", 1024))
     p.add_argument("--config-file", default=_env("CONFIG_FILE", ""))
-    p.add_argument("--gpu-usage-mode", default=_env("GPU_USAGE_MODE", "default"))
+    p.add_argument("--gpu-usage-mode", default=_env("GPU_USAGE_MODE", "full"))
     p.add_argument("--device-count", type=int, default=_env_int("DEVICE_COUNT", 1))
-    p.add_argument("--model-type", default=_env("MODEL_TYPE", ""))
+    p.add_argument("--model-type", default=_env("MODEL_TYPE", "auto"))
     p.add_argument("--save-path", default=_env("SAVE_PATH", "/opt/wings/outputs"))
 
     _add_bool(p, "--trust-remote-code", "TRUST_REMOTE_CODE", True)
@@ -252,7 +252,7 @@ def parse_launch_args(argv: list[str] | None = None) -> LaunchArgs:
         port=args.port,
         model_name=args.model_name,
         model_path=args.model_path,
-        engine=args.engine,
+        engine=engine,
         input_length=args.input_length,
         output_length=args.output_length,
         config_file=args.config_file,

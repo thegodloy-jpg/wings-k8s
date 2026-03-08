@@ -29,7 +29,7 @@ from app.utils.file_utils import safe_write_file
 logger = logging.getLogger(__name__)
 
 root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_LOG_DIR = os.path.join(root_dir, "wings", 'logs')
+_LOG_DIR = os.path.join(root_dir, 'logs')
 
 
 def wait_for_process_startup(
