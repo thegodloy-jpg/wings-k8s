@@ -1,0 +1,69 @@
+# service-mindie-ascend-dist.yaml
+# 用途：ST 昇腾 MindIE 分布式验证 Service
+# 日期：2026-03-03
+# 目标：7.6.52.110（rank-0）+ 7.6.52.170（rank-1）
+# 配套：statefulset-mindie-ascend-dist.yaml
+# namespace：wings-verify-st-dist
+#
+# 注意：StatefulSet 使用 hostNetwork: true
+#   - HCCL 通信使用真实宿主机 IP（7.6.52.110 ↔ 7.6.52.170）
+#   - Headless Service 仅用于 Pod 生命周期管理，不需要 HCCL-specific 端口
+# ---------------------------------------------------------------------------
+
+# --- Namespace ----
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wings-verify-st-dist
+  labels:
+    owner: zhanghui
+
+---
+# --- Headless Service：StatefulSet 所需，提供 Pod DNS 记录 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-hl
+  namespace: wings-verify-st-dist
+  labels:
+    app: infer-st-dist
+    owner: zhanghui
+spec:
+  clusterIP: None
+  selector:
+    app: infer-st-dist
+  ports:
+    - name: mindie-comm
+      port: 27070              # MindIE HCCL 通信端口（MASTER_PORT）
+      targetPort: 27070
+    - name: proxy
+      port: 18000
+      targetPort: 18000
+    - name: health
+      port: 19000
+      targetPort: 19000
+
+---
+# --- ClusterIP Service：对外暴露，只路由 rank-0（infer-0）的 HTTP 接口 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-api
+  namespace: wings-verify-st-dist
+  labels:
+    app: infer-st-dist
+    owner: zhanghui
+spec:
+  type: ClusterIP
+  selector:
+    app: infer-st-dist
+    statefulset.kubernetes.io/pod-name: infer-0
+  ports:
+    - name: proxy
+      port: 18000
+      targetPort: 18000
+      protocol: TCP
+    - name: health
+      port: 19000
+      targetPort: 19000
+      protocol: TCP

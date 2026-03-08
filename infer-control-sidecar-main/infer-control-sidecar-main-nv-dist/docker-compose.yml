@@ -1,0 +1,32 @@
+# docker-compose.yml
+# 用途：NV 分布式验证项目 — 镜像构建入口
+# 日期：2026-03-03
+#
+# 说明：本项目不使用 docker-compose 直接运行服务（服务在 k3s 容器内的 K8s 中运行）
+# 该文件仅用于 wings-infer 镜像的本地构建
+#
+# 构建命令：
+#   docker compose build wings-infer-zhanghui
+#   docker compose build --no-cache wings-infer-zhanghui
+#
+# 同步到 .150：
+#   docker save wings-infer:dist-nv-zhanghui-20260303 \
+#     | ssh root@7.6.16.150 docker load
+#
+# k3s 集群环境启动请使用：
+#   docker-compose-dist-nv-20260303.yml
+# ---------------------------------------------------------------------------
+version: '3.8'
+
+services:
+  wings-infer-zhanghui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wings-infer:dist-nv-zhanghui-20260303
+    container_name: wings-infer-build-zhanghui
+    # 仅构建用，不运行
+    profiles:
+      - build-only
+
+networks: {}

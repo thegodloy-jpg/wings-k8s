@@ -1,0 +1,17 @@
+# Web/API runtime
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+httpx==0.25.2
+orjson
+
+# Env/config runtime
+python-dotenv==1.0.0
+
+# Optional (distributed helper paths; not needed for single-node vLLM MVP)
+# netifaces
+# ray
+
+# Optional (Ascend only)
+# torch-npu

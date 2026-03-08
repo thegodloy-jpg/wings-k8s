@@ -1,0 +1,285 @@
+# =============================================================================
+# File: core/start_args_compat.py
+# Purpose: CLI 启动参数兼容层 — 将旧版 wings_start.sh 的参数语义迁移到 Python
+#          launcher 中，使部署脚本、环境变量和历史参数名可继续复用。
+# Architecture:
+#   命令行 / 环境变量  →  build_parser()  →  parse_launch_args()  →  LaunchArgs
+#   LaunchArgs 作为标准化输入传递给 wings_entry.py 的 build_launcher_plan()。
+# Design:
+#   - 每个参数同时支持 CLI 和环境变量两种来源，环境变量作为默认值。
+#   - 布尔参数使用 _add_bool 辅助函数，兼容 "1"/"true"/"yes" 等多种写法。
+#   - LaunchArgs 为不可变 dataclass，便于日志打印和序列化。
+# =============================================================================
+
+"""启动参数兼容层。
+
+目标是把旧的 `wings_start.sh` 参数语义迁移到 Python launcher 中，
+让部署脚本、环境变量和历史参数名仍然可以继续复用。
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from dataclasses import dataclass
+
+
+def _env(name: str, default: str = "") -> str:
+    """从环境变量读取字符串值，不存在时返回默认值。
+
+    所有 CLI 参数都优先支持从环境变量读取，
+    这样 Dockerfile / K8s Deployment 可以直接通过 env 设置参数。
+    """
+    return os.getenv(name, default)
+
+
+def _env_int(name: str, default: int) -> int:
+    """从环境变量读取整数值，解析失败时返回默认值。"""
+    try:
+        return int(_env(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """从环境变量读取浮点值，解析失败时返回默认值。"""
+    try:
+        return float(_env(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _to_bool(raw: str | bool) -> bool:
+    """统一解析命令行和环境变量中的布尔值。
+
+    支持多种真值写法："1", "true", "yes", "on"
+    支持多种假值写法："0", "false", "no", "off"
+    其他值抛出 ArgumentTypeError，防止静默误判。
+    """
+    if isinstance(raw, bool):
+        return raw
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid bool: {raw}")
+
+
+def _add_bool(parser: argparse.ArgumentParser, flag: str, env_name: str, default: bool) -> None:
+    """给 parser 添加兼容型布尔参数。
+
+    使用 nargs="?" + const=True 的技巧，使参数支持以下三种用法：
+    - --flag          → True（无值时取 const）
+    - --flag true     → True（显式传值）
+    - 省略            → 从环境变量 env_name 读取，再回退到 default
+    """
+    parser.add_argument(
+        flag,
+        nargs="?",
+        const=True,
+        default=_to_bool(_env(env_name, str(default).lower())),
+        type=_to_bool,
+    )
+
+
+@dataclass(frozen=True)
+class LaunchArgs:
+    """launcher 所需的标准化参数集合。
+
+    该 dataclass 是 CLI 解析后的规范化输出，frozen=True 保证创建后不可变。
+    所有字段均为基本类型（str/int/float/bool），便于序列化、日志和传递。
+
+    Attributes:
+        host:           监听地址，默认 0.0.0.0（绑定所有网卡）
+        port:           对外服务端口，默认 18000（proxy 层端口）
+        model_name:     模型名称（必填），用于日志和 API 路由标识
+        model_path:     模型权重文件路径，默认 /weights
+        engine:         推理引擎类型：vllm / vllm_ascend / sglang / mindie
+        input_length:   最大输入序列长度（tokens），用于计算 max_model_len
+        output_length:  最大输出序列长度（tokens），用于计算 max_model_len
+        config_file:    用户自定义 JSON 配置文件路径
+        gpu_usage_mode: GPU 使用模式：full（完整卡）/ mig（MIG 切片）/ default
+        device_count:   设备数量（GPU/NPU 数），影响张量并行度
+        model_type:     模型类型：llm / embedding / rerank / mmgm / mmum
+        save_path:      输出保存路径（如 MMGM 生成结果）
+        trust_remote_code: 是否信任远程代码（HuggingFace 模型加载）
+        dtype:          推理精度类型：auto / float16 / bfloat16 等
+        kv_cache_dtype: KV Cache 存储精度
+        quantization:   量化方法：空串表示不量化，可选 awq / gptq / fp8 等
+        quantization_param_path: 量化参数文件路径
+        gpu_memory_utilization:  GPU 显存利用率上限，默认 0.9
+        enable_chunked_prefill:  是否启用分块 prefill（降低首 token 延迟）
+        block_size:     PagedAttention 块大小，默认 16
+        max_num_seqs:   最大并发序列数，默认 32
+        seed:           随机种子
+        enable_expert_parallel: 是否启用 MOE 专家并行
+        max_num_batched_tokens: 单批次最大 token 数
+        enable_prefix_caching:  是否启用前缀缓存（加速共享前缀场景）
+        enable_speculative_decode: 是否启用推测解码
+        speculative_decode_model_path: 推测解码小模型路径
+        enable_rag_acc: 是否启用 RAG 加速
+        enable_auto_tool_choice: 是否自动选择工具调用
+        distributed:    是否启用多节点分布式推理
+        nnodes:         分布式节点总数
+        node_rank:      当前节点编号（0 为 head 节点）
+        head_node_addr: head 节点 IP 地址
+        distributed_executor_backend: 分布式后端：ray / dp_deployment
+    """
+
+    host: str
+    port: int
+    model_name: str
+    model_path: str
+    engine: str
+    input_length: int
+    output_length: int
+    config_file: str
+    gpu_usage_mode: str
+    device_count: int
+    model_type: str
+    save_path: str
+    trust_remote_code: bool
+    dtype: str
+    kv_cache_dtype: str
+    quantization: str
+    quantization_param_path: str
+    gpu_memory_utilization: float
+    enable_chunked_prefill: bool
+    block_size: int
+    max_num_seqs: int
+    seed: int
+    enable_expert_parallel: bool
+    max_num_batched_tokens: int
+    enable_prefix_caching: bool
+    enable_speculative_decode: bool
+    speculative_decode_model_path: str
+    enable_rag_acc: bool
+    enable_auto_tool_choice: bool
+    distributed: bool
+    nnodes: int
+    node_rank: int
+    head_node_addr: str
+    distributed_executor_backend: str
+
+    def to_namespace(self) -> argparse.Namespace:
+        """转换为 argparse.Namespace，便于传递给配置合并层 config_loader。"""
+        return argparse.Namespace(**self.__dict__)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """维护 launcher 的 CLI 契约。
+
+    所有参数均支持环境变量回退（通过 _env / _env_int / _env_float）。
+    参数名使用 kebab-case（如 --model-name），argparse 自动转为
+    snake_case（如 model_name）供代码使用。
+    """
+    p = argparse.ArgumentParser(prog="wings-launcher-v4")
+    p.add_argument("--host", default=_env("HOST", "0.0.0.0"))
+    p.add_argument("--port", type=int, default=_env_int("PORT", 18000))
+    p.add_argument("--model-name", default=_env("MODEL_NAME", ""))
+    p.add_argument("--model-path", default=_env("MODEL_PATH", "/weights"))
+    p.add_argument("--engine", default=_env("ENGINE", "vllm"))
+    p.add_argument("--input-length", type=int, default=_env_int("INPUT_LENGTH", 4096))
+    p.add_argument("--output-length", type=int, default=_env_int("OUTPUT_LENGTH", 1024))
+    p.add_argument("--config-file", default=_env("CONFIG_FILE", ""))
+    p.add_argument("--gpu-usage-mode", default=_env("GPU_USAGE_MODE", "default"))
+    p.add_argument("--device-count", type=int, default=_env_int("DEVICE_COUNT", 1))
+    p.add_argument("--model-type", default=_env("MODEL_TYPE", ""))
+    p.add_argument("--save-path", default=_env("SAVE_PATH", "/opt/wings/outputs"))
+
+    _add_bool(p, "--trust-remote-code", "TRUST_REMOTE_CODE", True)
+    p.add_argument("--dtype", default=_env("DTYPE", "auto"))
+    p.add_argument("--kv-cache-dtype", default=_env("KV_CACHE_DTYPE", "auto"))
+    p.add_argument("--quantization", default=_env("QUANTIZATION", ""))
+    p.add_argument("--quantization-param-path", default=_env("QUANTIZATION_PARAM_PATH", ""))
+    p.add_argument("--gpu-memory-utilization", type=float, default=_env_float("GPU_MEMORY_UTILIZATION", 0.9))
+    _add_bool(p, "--enable-chunked-prefill", "ENABLE_CHUNKED_PREFILL", False)
+    p.add_argument("--block-size", type=int, default=_env_int("BLOCK_SIZE", 16))
+    p.add_argument("--max-num-seqs", type=int, default=_env_int("MAX_NUM_SEQS", 32))
+    p.add_argument("--seed", type=int, default=_env_int("SEED", 0))
+    _add_bool(p, "--enable-expert-parallel", "ENABLE_EXPERT_PARALLEL", False)
+    p.add_argument("--max-num-batched-tokens", type=int, default=_env_int("MAX_NUM_BATCHED_TOKENS", 4096))
+    _add_bool(p, "--enable-prefix-caching", "ENABLE_PREFIX_CACHING", False)
+
+    _add_bool(p, "--enable-speculative-decode", "ENABLE_SPECULATIVE_DECODE", False)
+    p.add_argument("--speculative-decode-model-path", default=_env("SPECULATIVE_DECODE_MODEL_PATH", ""))
+    _add_bool(p, "--enable-rag-acc", "ENABLE_RAG_ACC", False)
+    _add_bool(p, "--enable-auto-tool-choice", "ENABLE_AUTO_TOOL_CHOICE", False)
+    _add_bool(p, "--distributed", "DISTRIBUTED", False)
+
+    p.add_argument("--nnodes", type=int, default=_env_int("NNODES", 1))
+    p.add_argument("--node-rank", type=int, default=_env_int("NODE_RANK", 0))
+    p.add_argument("--head-node-addr", default=_env("HEAD_NODE_ADDR", "127.0.0.1"))
+    p.add_argument("--distributed-executor-backend", default=_env("DISTRIBUTED_EXECUTOR_BACKEND", "ray"))
+    return p
+
+
+# 支持的推理引擎白名单；不在此集合中的 engine 值将被 parse_launch_args 拒绝
+SUPPORTED_ENGINES = {"vllm", "vllm_ascend", "sglang", "mindie"}
+
+
+def parse_launch_args(argv: list[str] | None = None) -> LaunchArgs:
+    """解析命令行参数并做最小合法性校验，返回标准化 LaunchArgs。
+
+    校验规则：
+    - model_name 为必填项（空值将抛出 ValueError）
+    - engine 必须在 SUPPORTED_ENGINES 白名单中
+
+    Args:
+        argv: 命令行参数列表，None 时从 sys.argv 读取
+
+    Returns:
+        LaunchArgs: 校验通过的标准化参数集合
+
+    Raises:
+        ValueError: model_name 为空或 engine 不支持
+    """
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not args.model_name:
+        raise ValueError("model_name is required")
+    engine = str(args.engine).lower()
+    if engine not in SUPPORTED_ENGINES:
+        raise ValueError(
+            f"unsupported engine '{engine}'; "
+            f"supported engines: {sorted(SUPPORTED_ENGINES)}"
+        )
+
+    return LaunchArgs(
+        host=args.host,
+        port=args.port,
+        model_name=args.model_name,
+        model_path=args.model_path,
+        engine=args.engine,
+        input_length=args.input_length,
+        output_length=args.output_length,
+        config_file=args.config_file,
+        gpu_usage_mode=args.gpu_usage_mode,
+        device_count=args.device_count,
+        model_type=args.model_type,
+        save_path=args.save_path,
+        trust_remote_code=bool(args.trust_remote_code),
+        dtype=args.dtype,
+        kv_cache_dtype=args.kv_cache_dtype,
+        quantization=args.quantization,
+        quantization_param_path=args.quantization_param_path,
+        gpu_memory_utilization=float(args.gpu_memory_utilization),
+        enable_chunked_prefill=bool(args.enable_chunked_prefill),
+        block_size=args.block_size,
+        max_num_seqs=args.max_num_seqs,
+        seed=args.seed,
+        enable_expert_parallel=bool(args.enable_expert_parallel),
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        enable_prefix_caching=bool(args.enable_prefix_caching),
+        enable_speculative_decode=bool(args.enable_speculative_decode),
+        speculative_decode_model_path=args.speculative_decode_model_path,
+        enable_rag_acc=bool(args.enable_rag_acc),
+        enable_auto_tool_choice=bool(args.enable_auto_tool_choice),
+        distributed=bool(args.distributed),
+        nnodes=int(args.nnodes),
+        node_rank=int(args.node_rank),
+        head_node_addr=str(args.head_node_addr),
+        distributed_executor_backend=str(args.distributed_executor_backend),
+    )

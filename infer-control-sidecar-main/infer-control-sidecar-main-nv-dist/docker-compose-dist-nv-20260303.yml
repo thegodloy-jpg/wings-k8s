@@ -1,0 +1,105 @@
+# docker-compose-dist-nv-20260303.yml
+# 用途：NV 分布式验证环境 k3s 集群容器启动脚本（方案 A）
+# 日期：2026-03-03
+# 作者：zhanghui
+#
+# 原则：全部操作在 k3s 容器内进行，不影响物理机 7.6.52.148 / 7.6.16.150 上的现有服务
+#
+# 使用方式：
+#   【在 7.6.52.148 上执行 server 节点】
+#     docker compose -f docker-compose-dist-nv-20260303.yml \
+#       --profile server up -d
+#
+#   【在 7.6.16.150 上执行 agent 节点，需先从 .148 获取 join-token】
+#     K3S_TOKEN=<token> K3S_SERVER_URL=https://7.6.52.148:6443 \
+#     docker compose -f docker-compose-dist-nv-20260303.yml \
+#       --profile agent up -d
+#
+# 注意：
+#   两台机器的 /mnt/models 须挂载同一套模型文件（或各自拥有副本）
+#   /mnt/nvidia-libs 须提前准备（参考 Step 3 的 docker cp 脚本）
+# ---------------------------------------------------------------------------
+
+version: '3.8'
+
+services:
+
+  # ========================================================================
+  # k3s-dist-server-zhanghui
+  # 角色：k3s server（在 7.6.52.148 上启动）
+  # ========================================================================
+  k3s-dist-server-zhanghui:
+    image: rancher/k3s:v1.30.6-k3s1
+    container_name: k3s-dist-server-zhanghui
+    profiles:
+      - server
+    privileged: true
+    restart: unless-stopped
+    tmpfs:
+      - /run
+      - /var/run
+    environment:
+      - K3S_KUBECONFIG_MODE=644
+      - K3S_NODE_NAME=nv-dist-node-0
+    command: >
+      server
+      --node-external-ip=7.6.52.148
+      --flannel-iface=eth0
+      --disable=traefik
+      --write-kubeconfig=/etc/rancher/k3s/k3s.yaml
+    ports:
+      - "6443:6443"     # k8s API
+      - "18000:18000"   # wings-infer proxy（rank-0 Pod 流量）
+      - "19000:19000"   # wings-infer health
+    volumes:
+      - k3s-server-data-zhanghui:/var/lib/rancher/k3s
+      - /lib/modules:/lib/modules:ro
+      - /mnt/models:/mnt/models          # 模型文件
+      - /mnt/nvidia-libs:/mnt/nvidia-libs # nvidia 驱动库（libnvidia-ml / libcuda）
+      - /dev:/dev                         # GPU 设备透传
+    networks:
+      - k3s-dist-net-zhanghui
+
+  # ========================================================================
+  # k3s-dist-agent-zhanghui
+  # 角色：k3s agent（在 7.6.16.150 上启动）
+  # 需要先从 server 获取 token：
+  #   docker exec k3s-dist-server-zhanghui cat /var/lib/rancher/k3s/server/node-token
+  # ========================================================================
+  k3s-dist-agent-zhanghui:
+    image: rancher/k3s:v1.30.6-k3s1
+    container_name: k3s-dist-agent-zhanghui
+    profiles:
+      - agent
+    privileged: true
+    restart: unless-stopped
+    tmpfs:
+      - /run
+      - /var/run
+    environment:
+      - K3S_URL=${K3S_SERVER_URL}         # https://7.6.52.148:6443
+      - K3S_TOKEN=${K3S_TOKEN}            # 从 server 获取的 join token
+      - K3S_NODE_NAME=nv-dist-node-1
+    command: >
+      agent
+      --node-external-ip=7.6.16.150
+      --flannel-iface=eth0
+    volumes:
+      - k3s-agent-data-zhanghui:/var/lib/rancher/k3s
+      - /lib/modules:/lib/modules:ro
+      - /mnt/models:/mnt/models
+      - /mnt/nvidia-libs:/mnt/nvidia-libs
+      - /dev:/dev
+    networks:
+      - k3s-dist-net-zhanghui
+
+volumes:
+  k3s-server-data-zhanghui:
+    name: k3s-dist-server-data-zhanghui
+  k3s-agent-data-zhanghui:
+    name: k3s-dist-agent-data-zhanghui
+
+networks:
+  k3s-dist-net-zhanghui:
+    name: k3s-dist-net-zhanghui
+    driver: bridge

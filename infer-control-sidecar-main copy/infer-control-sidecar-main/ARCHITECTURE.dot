@@ -1,0 +1,37 @@
+digraph infer_control_sidecar {
+  rankdir=LR;
+  graph [fontname="Microsoft YaHei", labelloc="t", label="Infer Control Sidecar 架构图（Graphviz）"];
+  node  [shape=box, style="rounded", fontname="Microsoft YaHei"];
+  edge  [fontname="Microsoft YaHei"];
+
+  Client [shape=ellipse, label="客户端\n(业务调用方)"];
+
+  subgraph cluster_pod {
+    label="Kubernetes Pod: wings-infer";
+    style="rounded";
+
+    Sidecar [label="Wings-Infer Sidecar\nFastAPI 控制层\n端口:9000"];
+    Routes  [label="API 路由\n/health\n/v1/completions\n/v1/chat/completions\n/generate"];
+    EM      [label="EngineManager\n启动与就绪判定"];
+    CB      [label="CommandBuilder\n拼接引擎启动命令"];
+    PS      [label="ProxyService + HTTPClient\n请求转发到引擎"];
+    Shared  [shape=cylinder, label="共享卷 /shared-volume\nstart_command.sh"];
+    Engine  [label="推理引擎容器\nvLLM 或 SGLang\n端口:8000"];
+  }
+
+  Client -> Sidecar [label="HTTP 请求"];
+  Sidecar -> Routes [label="路由分发"];
+
+  Sidecar -> EM [label="容器启动时执行"];
+  EM -> CB [label="生成命令"];
+  CB -> Shared [label="写入脚本"];
+  Engine -> Shared [label="读取并执行"];
+  EM -> Engine [label="轮询 /health"];
+
+  Routes -> EM [label="检查 engine_ready"];
+  Routes -> PS [label="就绪后转发"];
+  PS -> Engine [label="POST /v1/* /generate"];
+  Engine -> PS [label="推理结果"];
+  PS -> Routes [label="回传"];
+  Routes -> Client [label="返回响应"];
+}

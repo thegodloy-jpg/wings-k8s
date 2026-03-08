@@ -1,0 +1,59 @@
+# service-dist-nv-20260303.yaml
+# 用途：NV 分布式验证专用 Service（方案 A — StatefulSet + Headless）
+# 日期：2026-03-03
+# 目标：7.6.52.148（rank-0）+ 7.6.16.150（rank-1），各 1 张 L20
+# 部署环境：k3s-dist-zhanghui 容器内（不影响物理机现有服务）
+# namespace：wings-verify-dist
+# ---------------------------------------------------------------------------
+
+# --- Headless Service：Pod 间互相发现，Head DNS 固定为 infer-0.infer-hl ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-hl
+  namespace: wings-verify-dist
+  labels:
+    app: infer-dist
+    owner: zhanghui
+spec:
+  clusterIP: None
+  selector:
+    app: infer-dist
+  ports:
+    - name: ray-gcs
+      port: 6379
+      targetPort: 6379
+    - name: dist-init        # SGLang rendezvous
+      port: 28030
+      targetPort: 28030
+    - name: dp-rpc           # vLLM DP RPC
+      port: 13355
+      targetPort: 13355
+    - name: engine
+      port: 17000
+      targetPort: 17000
+
+---
+# --- ClusterIP Service：对外暴露，只路由 rank-0（infer-0）---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-api
+  namespace: wings-verify-dist
+  labels:
+    app: infer-dist
+    owner: zhanghui
+spec:
+  type: ClusterIP
+  selector:
+    app: infer-dist
+    statefulset.kubernetes.io/pod-name: infer-0
+  ports:
+    - name: proxy
+      port: 18000
+      targetPort: 18000
+      protocol: TCP
+    - name: health
+      port: 19000
+      targetPort: 19000
+      protocol: TCP

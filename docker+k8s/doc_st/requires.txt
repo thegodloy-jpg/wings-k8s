@@ -1,0 +1,11 @@
+任务:昇腾场景下验证F:\zhanghui\wings-k8s\infer-control-sidecar-main\infer-control-sidecar-main整个项目，
+具体来说主要是单机场景使用deepseek1.5,验证对应场景中的，mindie以及vllm-ascend。
+资源：7.6.52.110 账户root密码Xfusion@123
+具体内容
+参考这个流程F:\zhanghui\wings-k8s\docker+k8s\doc_infer-control-sidecar-k8s-verify_sglang_20260228.md
+
+注意首先验证vllmascend，然后就再次验证mindie
+
+1. 昇腾场景中，引擎使用逻辑需要额外的环境变量。
+2.vllm-ascend的使用逻辑，相较于mindie会简单一些，mindie需要打环境变量，同时嗨哟啊替换配置文件
+3.这种差异，你可以参考F:\zhanghui\wings-k8s\wings中对应引擎的处理逻辑

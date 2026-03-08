@@ -1,0 +1,74 @@
+version: '3.8'
+
+services:
+  # Wings-Infer 控制容器
+  wings-infer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wings-infer
+    ports:
+      - "9000:9000"
+    environment:
+      - ENGINE_TYPE=vllm
+      - ENGINE_PORT=8000
+      - WINGS_PORT=9000
+      - MODEL_NAME=meta-llama/Llama-2-7b-chat-hf
+      - MODEL_PATH=/models
+      - TP_SIZE=1
+      - MAX_MODEL_LEN=4096
+    volumes:
+      - shared-volume:/shared-volume
+      - ./models:/models:ro
+    networks:
+      - wings-network
+    depends_on:
+      - vllm-engine
+    restart: unless-stopped
+
+  # vLLM 引擎容器
+  vllm-engine:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-engine
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        # 等待wings-infer写入启动命令
+        echo "Waiting for start command..."
+        while [ ! -f /shared-volume/start_command.sh ]; do
+          sleep 1
+        done
+
+        # 读取并执行启动命令
+        echo "Start command found, executing..."
+        cd /shared-volume
+        bash start_command.sh
+
+        # 写入运行状态
+        echo "running" > /shared-volume/engine_status.txt
+
+        # 保持容器运行
+        echo "Engine started successfully"
+        tail -f /dev/null
+    volumes:
+      - shared-volume:/shared-volume
+      - ./models:/models:ro
+    networks:
+      - wings-network
+    # 如果有GPU，取消以下注释
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  shared-volume:
+    driver: local
+
+networks:
+  wings-network:
+    driver: bridge

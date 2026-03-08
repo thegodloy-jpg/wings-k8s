@@ -1,0 +1,207 @@
+# pod-rank0-mindie-ascend-dist.yaml
+# 用途：ST 昇腾 MindIE 分布式验证 - Rank 0 Pod（head node）
+# 节点：7.6.52.110 (910b-47)，NODE_RANK=0
+# 日期：2026-03-04
+# namespace：wings-verify-st-dist
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Pod
+metadata:
+  name: infer-0
+  namespace: wings-verify-st-dist
+  labels:
+    app: infer-st-dist
+    rank: "0"
+    owner: zhanghui
+spec:
+  # 绑定到 .110 节点
+  nodeSelector:
+    kubernetes.io/hostname: 910b-47
+
+  hostNetwork: true       # 直接使用宿主机网络，HCCL 跨节点通信使用真实 IP
+  dnsPolicy: ClusterFirstWithHostNet
+
+  restartPolicy: Never    # 手动控制重启
+
+  # 容忍 disk-pressure taint（.110 /home 分区 98% 导致 k3s 自动打上此 taint）
+  tolerations:
+    - key: node.kubernetes.io/disk-pressure
+      operator: Exists
+      effect: NoSchedule
+
+  volumes:
+    - name: shared-volume
+      emptyDir: {}
+    - name: model-volume
+      hostPath:
+        path: /mnt/cephfs/models
+    - name: davinci0
+      hostPath:
+        path: /dev/davinci0
+    - name: davinci-manager
+      hostPath:
+        path: /dev/davinci_manager
+    - name: hisi-hdc
+      hostPath:
+        path: /dev/hisi_hdc
+    - name: ascend-driver-lib
+      hostPath:
+        path: /usr/local/Ascend/driver/lib64
+    - name: hccn-conf
+      hostPath:
+        path: /etc/hccn.conf
+        type: File
+    - name: npu-smi
+      hostPath:
+        path: /usr/local/sbin/npu-smi
+        type: File
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 2Gi
+
+  containers:
+    # ============================================================
+    # wings-infer 控制容器（rank-0：启动代理 + 健康检查端口）
+    # ============================================================
+    - name: wings-infer
+      image: wings-infer:zhanghui-ascend-st-dist
+      imagePullPolicy: IfNotPresent
+      ports:
+        - containerPort: 18000
+          name: proxy
+        - containerPort: 19000
+          name: health
+      env:
+        - name: WINGS_DEVICE
+          value: "ascend"
+        - name: DEVICE
+          value: "ascend"
+        - name: DEVICE_COUNT
+          value: "1"
+
+        # ---- 分布式参数 ----
+        - name: DISTRIBUTED
+          value: "true"
+        - name: NNODES
+          value: "2"
+        - name: NODE_RANK
+          value: "0"
+        - name: HEAD_NODE_ADDR
+          value: "7.6.52.110"
+        - name: NODE_IPS
+          value: "7.6.52.110,7.6.52.170"
+
+        # ---- 引擎配置 ----
+        - name: ENGINE
+          value: "mindie"
+
+        # ---- 模型配置 ----
+        - name: MODEL_NAME
+          value: "DeepSeek-R1-Distill-Qwen-1.5B"
+        - name: MODEL_PATH
+          value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+
+        # ---- 端口规划 ----
+        - name: PORT
+          value: "18000"
+        - name: HEALTH_PORT
+          value: "19000"
+
+        - name: WINGS_SKIP_PID_CHECK
+          value: "true"
+
+        # ---- HCCL RoCE 设备 IP（用于 rank table device_ip 字段）----
+        - name: HCCL_DEVICE_IPS
+          value: "10.20.0.2;10.20.0.18"
+
+      volumeMounts:
+        - name: shared-volume
+          mountPath: /shared-volume
+        - name: model-volume
+          mountPath: /models
+          readOnly: true
+
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "1Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 19000
+        initialDelaySeconds: 60
+        periodSeconds: 10
+        failureThreshold: 54
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 19000
+        initialDelaySeconds: 180
+        periodSeconds: 30
+        failureThreshold: 5
+
+    # ============================================================
+    # MindIE 引擎容器（rank-0 master 节点）
+    # ============================================================
+    - name: engine
+      image: mindie:2.2.RC1
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        privileged: true
+
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          echo "[engine rank-0] Starting MindIE engine container"
+          echo "[engine rank-0] Waiting for start_command.sh..."
+          while [ ! -f /shared-volume/start_command.sh ]; do
+            sleep 2
+          done
+          echo "[engine rank-0] start_command.sh found:"
+          cat /shared-volume/start_command.sh
+          echo "[engine rank-0] Executing..."
+          cd /shared-volume
+          bash start_command.sh || true
+          echo "[engine rank-0] Engine exited, sleeping for debug..."
+          sleep 3600
+
+      env:
+        - name: ASCEND_VISIBLE_DEVICES
+          value: "0"
+
+      volumeMounts:
+        - name: shared-volume
+          mountPath: /shared-volume
+        - name: model-volume
+          mountPath: /models
+          readOnly: true
+        - name: davinci0
+          mountPath: /dev/davinci0
+        - name: davinci-manager
+          mountPath: /dev/davinci_manager
+        - name: hisi-hdc
+          mountPath: /dev/hisi_hdc
+        - name: ascend-driver-lib
+          mountPath: /usr/local/Ascend/driver/lib64
+          readOnly: true
+        - name: hccn-conf
+          mountPath: /etc/hccn.conf
+          readOnly: true
+        - name: npu-smi
+          mountPath: /usr/local/sbin/npu-smi
+          readOnly: true
+        - name: dshm
+          mountPath: /dev/shm
+
+      resources:
+        requests:
+          cpu: "4"
+          memory: "16Gi"
+        limits:
+          cpu: "16"
+          memory: "48Gi"

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-api
+spec:
+  selector:
+    app.kubernetes.io/name: infer-vllm-ascend
+  ports:
+    - name: engine
+      port: 17000
+      targetPort: 17000
+    - name: proxy
+      port: 18000
+      targetPort: 18000
+    - name: health
+      port: 19000
+      targetPort: 19000

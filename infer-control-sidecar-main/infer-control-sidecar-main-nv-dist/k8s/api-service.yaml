@@ -1,0 +1,18 @@
+# api-service.yaml - ClusterIP Service for API access (Step 9)
+# Only routes to rank-0 (infer-0)
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-api
+  namespace: inference
+spec:
+  selector:
+    app: infer-dist
+    statefulset.kubernetes.io/pod-name: infer-0
+  ports:
+    - name: proxy
+      port: 18000
+      targetPort: 18000
+    - name: health
+      port: 19000
+      targetPort: 19000

@@ -1,0 +1,34 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-hl
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: infer-sglang
+  ports:
+    - name: dist-init
+      port: 28030
+    - name: engine
+      port: 17000
+    - name: proxy
+      port: 18000
+    - name: health
+      port: 19000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-api
+spec:
+  selector:
+    app.kubernetes.io/name: infer-sglang
+    statefulset.kubernetes.io/pod-name: infer-0
+  ports:
+    - name: proxy
+      port: 18000
+      targetPort: 18000
+    - name: health
+      port: 19000
+      targetPort: 19000

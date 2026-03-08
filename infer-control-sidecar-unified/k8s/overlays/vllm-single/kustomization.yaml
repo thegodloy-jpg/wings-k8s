@@ -1,0 +1,11 @@
+# vllm-single overlay
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - service.yaml
+  - deployment.yaml
+namespace: wings-infer
+commonLabels:
+  app.kubernetes.io/name: infer-vllm
+  app.kubernetes.io/component: single

@@ -1,0 +1,284 @@
+# statefulset-vllm-dp.yaml
+# 用途：双节点 vLLM DP 分布式验证 (按 nv.md 阶段四 Step 10)
+# 日期：2026-03-03
+# 方案：StatefulSet replicas=2, infer-0 on .148(a100), infer-1 on .150(ubuntu2204)
+# 引擎：vllm DP mode, 每 pod 1 张 L20
+# namespace: inference
+# ---------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: infer
+  namespace: inference
+spec:
+  serviceName: infer-hl
+  replicas: 2
+  selector:
+    matchLabels:
+      app: infer-dist
+  template:
+    metadata:
+      labels:
+        app: infer-dist
+    spec:
+      # hostNetwork: 绕过 flannel overlay (k3s-in-Docker 中跨节点 pod 网络不通)
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # 反亲和：确保 2 个 pod 分布到不同节点
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: infer-dist
+              topologyKey: kubernetes.io/hostname
+
+      volumes:
+        - name: shared-vol
+          emptyDir: {}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+        - name: models
+          hostPath:
+            path: /mnt/models
+        - name: nvidia-libs
+          hostPath:
+            path: /mnt/nvidia-libs
+            type: Directory
+        # nvidia 设备节点 — k3s-in-Docker 中必须显式挂载
+        # 两节点共有：nvidia0/1/nvidiactl/uvm/uvm-tools
+        # .148 额外有 nvidia-modeset（不挂载）
+        # .150 额外有 nvidia2/3（不挂载，engine 启动时 mknod 补充）
+        - name: dev-nvidia0
+          hostPath:
+            path: /dev/nvidia0
+            type: CharDevice
+        - name: dev-nvidia1
+          hostPath:
+            path: /dev/nvidia1
+            type: CharDevice
+        - name: dev-nvidiactl
+          hostPath:
+            path: /dev/nvidiactl
+            type: CharDevice
+        - name: dev-nvidia-uvm
+          hostPath:
+            path: /dev/nvidia-uvm
+            type: CharDevice
+        - name: dev-nvidia-uvm-tools
+          hostPath:
+            path: /dev/nvidia-uvm-tools
+            type: CharDevice
+
+      containers:
+        # ============================================================
+        # wings-infer 控制容器
+        # 分布式模式：读 NODE_RANK → 生成 head/worker 脚本
+        # ============================================================
+        - name: wings-infer
+          image: wings-infer:dist-nv-dev-zhanghui
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 18000
+              name: proxy
+            - containerPort: 19000
+              name: health
+          env:
+            # ---- 分布式配置 ----
+            - name: DISTRIBUTED
+              value: "true"
+            - name: NNODES
+              value: "2"
+            - name: NODE_RANK
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+            - name: HEAD_NODE_ADDR
+              value: "7.6.16.150"
+            - name: DISTRIBUTED_EXECUTOR_BACKEND
+              value: "dp"
+
+            # ---- 引擎配置 ----
+            - name: ENGINE
+              value: "vllm"
+            - name: ENGINE_PORT
+              value: "17000"
+
+            # ---- 模型配置 ----
+            - name: MODEL_NAME
+              value: "DeepSeek-R1-Distill-Qwen-1.5B"
+            - name: MODEL_PATH
+              value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+            - name: TP_SIZE
+              value: "1"
+            - name: MAX_MODEL_LEN
+              value: "2048"
+
+            # ---- 端口规划 ----
+            - name: PORT
+              value: "18000"
+            - name: HEALTH_PORT
+              value: "19000"
+            - name: WINGS_PORT
+              value: "18000"
+
+            # ---- K8s sidecar 模式 ----
+            - name: WINGS_SKIP_PID_CHECK
+              value: "true"
+            - name: ENABLE_ACCEL
+              value: "false"
+
+          volumeMounts:
+            - name: shared-vol
+              mountPath: /shared-volume
+            - name: models
+              mountPath: /models
+              readOnly: false
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 19000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 36
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 19000
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 5
+
+        # ============================================================
+        # 引擎容器（vLLM）
+        # privileged + hostPath nvidia-libs
+        # 动态选择第一张 L20 (不同节点索引不同)
+        # ============================================================
+        - name: engine
+          image: vllm/vllm-openai:v0.13.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              export LD_LIBRARY_PATH=/usr/lib/nvidia-host:${LD_LIBRARY_PATH:-}
+
+              # 补充 nvidia-host 目录中可能缺失的 symlink（k3s hostPath 不自动同步 symlink）
+              cd /usr/lib/nvidia-host
+              for f in lib*.so.*.*.*; do
+                [ -f "$f" ] || continue
+                sobase="${f%%.so.*}.so"
+                [ -e "${sobase}.1" ] || ln -sf "$f" "${sobase}.1"
+                [ -e "${sobase}" ] || ln -sf "${sobase}.1" "${sobase}"
+                echo "[engine] Created symlinks for $f -> ${sobase}.1 -> ${sobase}"
+              done
+              echo "[engine] nvidia-host libs:"; ls -la /usr/lib/nvidia-host/
+              cd /
+
+              # hostNetwork 模式: pod 使用宿主机网络，跨节点直接通信
+              HOST_IP=$(hostname -I | awk '{print $1}')
+              echo "[engine] hostNetwork mode, host IP: $HOST_IP"
+
+              # 注入 /etc/hosts 让 c10d 能解析 hostname（hostNetwork 下 hostname=节点名）
+              echo "7.6.16.150 ubuntu2204" >> /etc/hosts
+              echo "7.6.52.148 a100" >> /etc/hosts
+              echo "[engine] Injected /etc/hosts entries for cross-node hostname resolution"
+
+              # 设置 VLLM_HOST_IP 让 vLLM 使用真实 IP 而非 hostname
+              export VLLM_HOST_IP=$HOST_IP
+              echo "[engine] VLLM_HOST_IP=$VLLM_HOST_IP"
+
+              # 补充可能缺失的 nvidia 设备节点（.150 有 nvidia2/3 需 mknod）
+              for i in 2 3 4 5 6 7; do
+                if [ ! -e /dev/nvidia$i ]; then
+                  MAJOR=195
+                  if [ -e /proc/driver/nvidia ] && mknod /dev/nvidia$i c $MAJOR $i 2>/dev/null; then
+                    echo "[engine] Created /dev/nvidia$i (major=$MAJOR minor=$i)"
+                  fi
+                fi
+              done
+
+              # 动态选择第一张 L20 GPU
+              L20_IDX=$(nvidia-smi --query-gpu=index,name --format=csv,noheader 2>/dev/null | grep L20 | head -1 | cut -d',' -f1 | tr -d ' ')
+              if [ -z "$L20_IDX" ]; then
+                echo "[engine] WARNING: No L20 found via nvidia-smi, using GPU 0"
+                L20_IDX=0
+              fi
+              export CUDA_VISIBLE_DEVICES=$L20_IDX
+              echo "[engine] Selected GPU $L20_IDX (L20) via CUDA_VISIBLE_DEVICES"
+
+              echo "[engine] Waiting for start_command.sh..."
+              while [ ! -f /shared-volume/start_command.sh ]; do sleep 2; done
+              echo "[engine] start_command.sh found:"
+              cat /shared-volume/start_command.sh
+              echo "[engine] Executing..."
+              cd /shared-volume
+              bash start_command.sh
+
+          env:
+            - name: CUDA_DEVICE_ORDER
+              value: "PCI_BUS_ID"
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
+            # Gloo/NCCL 需要知道绑定哪个网卡（hostNetwork 模式下 hostname 无法解析）
+            - name: GLOO_SOCKET_IFNAME
+              value: "ens65f0"
+            - name: NCCL_SOCKET_IFNAME
+              value: "ens65f0"
+            - name: TP_SOCKET_IFNAME
+              value: "ens65f0"
+            # NCCL 调试 + 跨节点兼容性
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_P2P_DISABLE
+              value: "1"
+            - name: NCCL_SHM_DISABLE
+              value: "1"
+            - name: NCCL_IB_DISABLE
+              value: "1"
+            - name: NCCL_NET
+              value: "Socket"
+
+          volumeMounts:
+            - name: shared-vol
+              mountPath: /shared-volume
+            - name: models
+              mountPath: /models
+              readOnly: true
+            - name: nvidia-libs
+              mountPath: /usr/lib/nvidia-host
+            - name: dev-nvidia0
+              mountPath: /dev/nvidia0
+            - name: dev-nvidia1
+              mountPath: /dev/nvidia1
+            - name: dev-nvidiactl
+              mountPath: /dev/nvidiactl
+            - name: dev-nvidia-uvm
+              mountPath: /dev/nvidia-uvm
+            - name: dev-nvidia-uvm-tools
+              mountPath: /dev/nvidia-uvm-tools
+            - name: dshm
+              mountPath: /dev/shm
+
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "16"
+              memory: "48Gi"

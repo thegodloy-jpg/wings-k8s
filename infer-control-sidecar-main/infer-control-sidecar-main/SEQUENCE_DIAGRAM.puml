@@ -1,0 +1,42 @@
+@startuml
+title Infer Control Sidecar 时序图（启动 + 请求）
+skinparam defaultFontName Microsoft YaHei
+skinparam shadowing false
+
+actor "K8s/容器运行时" as K8s
+participant "wings-infer\n(FastAPI Sidecar)" as Sidecar
+participant "EngineManager" as EM
+participant "CommandBuilder" as CB
+participant "共享卷\n/shared-volume" as Vol
+participant "vLLM/SGlang\nEngine 容器" as Engine
+actor "客户端" as Client
+participant "ProxyService\n+ HTTPClient" as Proxy
+
+== 启动时序 ==
+K8s -> Sidecar: 启动容器进程
+Sidecar -> EM: start()
+EM -> CB: build_command()
+CB --> EM: 引擎启动命令
+EM -> Vol: 写入 start_command.sh
+EM -> Engine: 轮询 GET /health (127.0.0.1:8000)
+Engine -> Vol: 读取并执行 start_command.sh
+Engine --> EM: health=200（就绪）
+EM --> Sidecar: engine_started=True
+
+== 请求时序 ==
+Client -> Sidecar: POST /v1/chat/completions
+Sidecar -> EM: is_engine_ready()
+EM --> Sidecar: True
+Sidecar -> Proxy: forward_chat(...)
+Proxy -> Engine: POST /v1/chat/completions
+Engine --> Proxy: 推理结果(JSON)
+Proxy --> Sidecar: 返回响应
+Sidecar --> Client: 200 + 结果
+
+== 未就绪分支 ==
+Client -> Sidecar: POST /v1/completions
+Sidecar -> EM: is_engine_ready()
+EM --> Sidecar: False
+Sidecar --> Client: 503 Engine is not ready yet
+
+@enduml

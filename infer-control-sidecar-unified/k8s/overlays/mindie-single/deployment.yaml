@@ -1,0 +1,116 @@
+# Deployment: MindIE 单机推理（Ascend NPU）
+# 这个清单体现了 sidecar 架构的关键思想：
+# 1. `wings-infer` 容器负责生成启动脚本，并托管 proxy/health。
+# 2. `engine` 容器阻塞等待共享卷中的 `start_command.sh`，然后真正拉起 MindIE。
+# 3. 两个容器通过 `shared-volume` 协作，而不是直接相互拉起进程。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infer-mindie
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infer-mindie
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      volumes:
+        - name: shared-volume
+          emptyDir: {}
+        - name: model-volume
+          hostPath:
+            path: /mnt/cephfs/models                    # 需要改成实际模型目录
+            type: DirectoryOrCreate
+        - name: davinci0
+          hostPath:
+            path: /dev/davinci0
+            type: CharDevice
+        - name: davinci-manager
+          hostPath:
+            path: /dev/davinci_manager
+            type: CharDevice
+        - name: hisi-hdc
+          hostPath:
+            path: /dev/hisi_hdc
+        - name: ascend-driver
+          hostPath:
+            path: /usr/local/Ascend/driver
+            type: Directory
+
+      containers:
+        - name: wings-infer
+          image: wings-infer:latest                      # 需要替换为实际镜像
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 18000
+            - containerPort: 19000
+          env:
+            - name: WINGS_DEVICE
+              value: "ascend"
+            - name: DEVICE
+              value: "ascend"
+            - name: ENGINE
+              value: "mindie"
+            - name: MODEL_NAME
+              value: "DeepSeek-R1-Distill-Qwen-1.5B"     # 需要改成实际模型名
+            - name: MODEL_PATH
+              value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+            - name: PORT
+              value: "18000"   # 对外 API 端口，实际是 proxy 监听端口
+            - name: HEALTH_PORT
+              value: "19000"   # 独立健康服务端口，供 readinessProbe 调用
+            - name: WINGS_SKIP_PID_CHECK
+              value: "true"    # sidecar 场景下可跳过 PID 校验，避免跨容器 PID 不可见
+          volumeMounts:
+            - name: shared-volume
+              mountPath: /shared-volume
+            - name: model-volume
+              mountPath: /models
+              readOnly: true
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "2", memory: "4Gi" }
+          readinessProbe:
+            httpGet: { path: /health, port: 19000 }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 54
+
+        - name: engine
+          image: mindie:2.2.RC1                          # 需要替换为实际 MindIE 镜像
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              # 等待 launcher 在共享卷中写出启动脚本，再执行真正的引擎启动命令。
+              while [ ! -f /shared-volume/start_command.sh ]; do sleep 2; done
+              cd /shared-volume && bash start_command.sh
+          env:
+            - name: ASCEND_VISIBLE_DEVICES
+              value: "0"
+          volumeMounts:
+            - name: shared-volume
+              mountPath: /shared-volume
+            - name: model-volume
+              mountPath: /models
+              readOnly: true
+            - name: davinci0
+              mountPath: /dev/davinci0
+            - name: davinci-manager
+              mountPath: /dev/davinci_manager
+            - name: hisi-hdc
+              mountPath: /dev/hisi_hdc
+            - name: ascend-driver
+              mountPath: /usr/local/Ascend/driver
+              readOnly: true
+          resources:
+            requests: { cpu: "4", memory: "16Gi" }
+            limits: { cpu: "16", memory: "48Gi" }

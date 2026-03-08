@@ -1,0 +1,44 @@
+@startuml
+title Infer Control Sidecar 架构图（PlantUML）
+
+skinparam defaultFontName Microsoft YaHei
+skinparam shadowing false
+skinparam packageStyle rectangle
+
+actor "客户端\n(业务调用方)" as Client
+
+rectangle "Kubernetes Pod: wings-infer" {
+  component "Wings-Infer Sidecar\nFastAPI 控制层\n端口:9000" as Sidecar
+  component "API 路由\n/health\n/v1/completions\n/v1/chat/completions\n/generate" as Routes
+  component "EngineManager\n启动与就绪判定" as EM
+  component "CommandBuilder\n拼接引擎启动命令" as CB
+  component "ProxyService + HTTPClient\n请求转发到引擎" as PS
+  database "共享卷\n/shared-volume\nstart_command.sh" as Shared
+
+  node "推理引擎容器\nvLLM 或 SGLang\n端口:8000" as Engine
+}
+
+Client --> Sidecar : HTTP 请求
+Sidecar --> Routes : 路由分发
+
+Sidecar --> EM : 容器启动时执行
+EM --> CB : 生成命令
+CB --> Shared : 写入 start_command.sh
+Engine --> Shared : 读取并执行命令
+EM --> Engine : 轮询 /health\n判定引擎是否就绪
+
+Routes --> EM : 检查 engine_ready
+Routes --> PS : 就绪后转发推理请求
+PS --> Engine : POST /v1/* 或 /generate
+Engine --> PS : 返回推理结果
+PS --> Routes : 回传响应
+Routes --> Client : 返回结果
+
+note right of Sidecar
+  核心职责:
+  1) 控制引擎启动
+  2) 统一对外 API
+  3) 代理并转发请求
+end note
+
+@enduml

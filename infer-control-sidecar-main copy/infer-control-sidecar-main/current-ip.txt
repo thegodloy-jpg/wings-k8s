@@ -1,0 +1,2 @@
+ClusterIP: 10.255.131.155
+NodePort: 64566

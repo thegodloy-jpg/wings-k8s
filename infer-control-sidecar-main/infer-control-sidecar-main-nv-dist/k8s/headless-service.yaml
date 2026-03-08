@@ -1,0 +1,20 @@
+# headless-service.yaml - Headless Service for Pod discovery (Step 9)
+# Pod 间通信：ray-gcs(6379), dist-init(28030), dp-rpc(13355), engine(17000)
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-hl
+  namespace: inference
+spec:
+  clusterIP: None
+  selector:
+    app: infer-dist
+  ports:
+    - name: ray-gcs
+      port: 6379
+    - name: dist-init
+      port: 28030
+    - name: dp-rpc
+      port: 13355
+    - name: engine
+      port: 17000

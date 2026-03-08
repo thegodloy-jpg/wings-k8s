@@ -1,0 +1,16 @@
+# Web/API runtime
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+httpx==0.25.2
+orjson
+
+# Env/config runtime
+python-dotenv==1.0.0
+
+# Distributed support（NV 分布式版本启用）
+ray[default]>=2.9.0
+
+# Optional (Ascend only — NV 场景不需要)
+# torch-npu

@@ -1,0 +1,219 @@
+# deployment-vllm-ascend.verify.yaml
+# 用途：k3s-verify 验证环境 — vllm-ascend 引擎（昇腾 910B2C）
+# 核心特点：
+#   1. ENGINE=vllm_ascend，wings-infer 生成含 Ascend env 的启动命令
+#   2. wings-infer 镜像：wings-infer:zhanghui-ascend-st（tag 含 zhanghui 字段，必须）
+#   3. 引擎镜像：quay.io/ascend/vllm-ascend:v0.14.0rc1（官方昇腾 vllm 镜像）
+#   4. NPU 锁定 NPU 0（ASCEND_VISIBLE_DEVICES=0），privileged 模式访问 /dev/davinci*
+#   5. 宿主机 CANN 库通过 hostPath(/usr/local/Ascend) 挂载进引擎容器
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wings-infer-vllm-ascend
+  namespace: wings-verify
+  labels:
+    app: wings-infer-vllm-ascend
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: wings-infer-vllm-ascend
+  template:
+    metadata:
+      labels:
+        app: wings-infer-vllm-ascend
+    spec:
+      # 验证环境磁盘使用率较高（>97%），添加容忍以允许调度
+      tolerations:
+        - key: "node.kubernetes.io/disk-pressure"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "node.kubernetes.io/memory-pressure"
+          operator: "Exists"
+          effect: "NoSchedule"
+      volumes:
+        - name: shared-volume
+          emptyDir: {}
+        - name: model-volume
+          hostPath:
+            path: /mnt/cephfs/models
+            type: DirectoryOrCreate
+        # /dev/davinci* CharDevice 设备通过 privileged 直接访问（不需要 hostPath CharDevice）
+        # 但 CANN driver 库需要通过 hostPath Directory 挂载（k3s-verify 已挂载此路径）
+        - name: ascend-driver
+          hostPath:
+            path: /usr/local/Ascend/driver
+            type: Directory
+
+      containers:
+        # ============================================================
+        # Wings-Infer 控制容器（Ascend ST 版本）
+        # tag：wings-infer:zhanghui-ascend-st（含 zhanghui 字段，k3s-verify 规范）
+        # 端口：18000=proxy(对外推理接口)  19000=health(健康探针)
+        # ============================================================
+        - name: wings-infer
+          image: wings-infer:zhanghui-ascend-st
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 18000
+              name: proxy
+            - containerPort: 19000
+              name: health
+          env:
+            # ---- 引擎配置 ----
+            - name: ENGINE
+              value: "vllm_ascend"
+            - name: ENGINE_PORT
+              value: "17000"
+            # ---- 端口规划 ----
+            - name: PORT
+              value: "18000"
+            - name: HEALTH_PORT
+              value: "19000"
+            - name: WINGS_PORT
+              value: "18000"
+            # ---- 模型配置 ----
+            - name: MODEL_NAME
+              value: "DeepSeek-R1-Distill-Qwen-1.5B"
+            - name: MODEL_PATH
+              value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+            - name: DEVICE_COUNT
+              value: "1"
+            # ---- 推理参数 ----
+            - name: INPUT_LENGTH
+              value: "4096"
+            - name: OUTPUT_LENGTH
+              value: "1024"
+            - name: GPU_MEMORY_UTILIZATION
+              value: "0.9"
+            - name: MAX_NUM_SEQS
+              value: "32"
+            - name: TRUST_REMOTE_CODE
+              value: "true"
+            # ---- 硬件声明 ----
+            - name: WINGS_DEVICE
+              value: "ascend"
+            - name: DEVICE
+              value: "ascend"
+            # NPU 0 被使用（k3s 嵌套环境无法通过 env var 切换 NPU，使用默认 NPU 0）
+            # ---- K8s sidecar 模式 ----
+            - name: ENABLE_ACCEL
+              value: "false"
+            - name: WINGS_SKIP_PID_CHECK
+              value: "true"
+            - name: SHARED_VOLUME_PATH
+              value: "/shared-volume"
+          volumeMounts:
+            - name: shared-volume
+              mountPath: /shared-volume
+            - name: model-volume
+              mountPath: /models
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 19000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 60          # NPU 冷启动容忍 10 分钟
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 19000
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 5
+
+        # ============================================================
+        # vllm-ascend 引擎容器
+        # 镜像：quay.io/ascend/vllm-ascend:v0.14.0rc1（官方昇腾镜像，无需改 tag）
+        # NPU：使用 NPU 0（k3s-verify 嵌套环境中无法通过 env var 切换 NPU）
+        # 说明：ASCEND_VISIBLE_DEVICES 需要 Ascend Docker Runtime hook（k3s 内无效）
+        #       vllm TP=1 hardcodes local_rank=0 -> set_device(0)，不受 ASCEND_DEVICE_ID 影响
+        #       若需要指定 NPU，需安装 Ascend Device Plugin for k8s
+        # ============================================================
+        - name: vllm-ascend-engine
+          image: quay.io/ascend/vllm-ascend:v0.14.0rc1
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true      # 打通 /dev/davinci* 设备访问
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              # ── NOTE: vllm-ascend:v0.14.0rc1 has CANN 8.5.0 built-in + env vars preset
+              # ── ASCEND_TOOLKIT_HOME, LD_LIBRARY_PATH etc. are already set by the image
+              # ── Only driver libs need to come from host (/usr/local/Ascend/driver)
+              
+              # ── 验证环境使用 NPU 0（k3s 嵌套环境中无法通过 env var 切换 NPU）
+              # ── ASCEND_VISIBLE_DEVICES 需要 Ascend Docker Runtime hook（k3s 内无效）
+              # ── vllm TP=1 hardcodes local_rank=0，set_device(0) = 物理 NPU 0
+              echo "=== CANN env (built into image) ==="
+              echo "ASCEND_TOOLKIT_HOME=$ASCEND_TOOLKIT_HOME"
+              echo "ASCEND_HOME_PATH=$ASCEND_HOME_PATH"
+              echo "ASCEND_DEVICE_ID=$ASCEND_DEVICE_ID"
+              echo "=== Device files ==="
+              ls /dev/davinci2 /dev/davinci_manager 2>&1 | head -5
+
+              echo "=== Waiting for start_command.sh from wings-infer... ==="
+              while [ ! -f /shared-volume/start_command.sh ]; do
+                sleep 1
+              done
+
+              echo "=== start_command.sh found, content: ==="
+              cat /shared-volume/start_command.sh
+
+              echo "=== Executing start_command.sh ==="
+              cd /shared-volume
+              bash start_command.sh &
+              ENGINE_PID=$!
+
+              echo "=== Waiting for vllm-ascend engine on port 17000 ==="
+              WAIT_COUNT=0
+              while ! nc -z 127.0.0.1 17000 2>/dev/null; do
+                sleep 2
+                WAIT_COUNT=$((WAIT_COUNT + 1))
+                if ! kill -0 $ENGINE_PID 2>/dev/null; then
+                  echo "ERROR: vllm-ascend engine process died (PID=$ENGINE_PID)"
+                  exit 1
+                fi
+                if [ $WAIT_COUNT -ge 300 ]; then
+                  echo "ERROR: Timeout waiting for vllm-ascend engine (600s)"
+                  exit 1
+                fi
+              done
+              echo "=== vllm-ascend engine is ready on port 17000 ==="
+
+              wait $ENGINE_PID
+              EXIT_CODE=$?
+              echo "Engine exited with code $EXIT_CODE"
+              exit $EXIT_CODE
+          env: []
+          volumeMounts:
+            - name: shared-volume
+              mountPath: /shared-volume
+            - name: model-volume
+              mountPath: /models
+              readOnly: true
+            # Ascend NPU driver 库（hostPath Directory，不是 CharDevice，可以在 k3s 嵌套环境工作）
+            # 宿主机 driver 挂载到镜像默认的 /usr/local/Ascend/driver 路径
+            # 镜像的 LD_LIBRARY_PATH 已包含此路径，无需额外配置
+            - name: ascend-driver
+              mountPath: /usr/local/Ascend/driver
+              readOnly: true
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "16"
+              memory: "64Gi"

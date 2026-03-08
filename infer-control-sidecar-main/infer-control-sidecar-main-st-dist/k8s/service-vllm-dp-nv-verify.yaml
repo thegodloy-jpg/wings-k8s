@@ -1,0 +1,27 @@
+# service-vllm-dp-nv-verify.yaml
+# 用途：vLLM DP 验证专用 Service（简单负载均衡）
+# 日期：2026-03-03
+# 选择 app: infer-dp-nv 的所有副本，轮询负载均衡
+# namespace：wings-verify-dist
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-dp-api
+  namespace: wings-verify-dist
+  labels:
+    app: infer-dp-nv
+    owner: zhanghui
+spec:
+  type: ClusterIP
+  selector:
+    app: infer-dp-nv
+  ports:
+    - name: proxy
+      port: 18000
+      targetPort: 18000
+      protocol: TCP
+    - name: health
+      port: 19000
+      targetPort: 19000
+      protocol: TCP

@@ -1,0 +1,117 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose-ascend-st.yml
+# 用途：昇腾 910B2C 场景下验证 infer-control-sidecar + vllm-ascend 引擎
+# NPU：使用空闲的 NPU 0（ASCEND_VISIBLE_DEVICES=0，勿改动 NPU 4-11）
+# 模型：/mnt/cephfs/models/DeepSeek-R1-Distill-Qwen-1.5B
+# 镜像：
+#   wings-infer: wings-infer:zhanghui-ascend-st（本地构建，tag 含 zhanghui 字段）
+#   engine:      quay.io/ascend/vllm-ascend:v0.14.0rc1
+# 端口：engine=17000, proxy=18000, health=19000
+# ─────────────────────────────────────────────────────────────────────────────
+version: '3.8'
+
+volumes:
+  shared-volume:
+
+services:
+  # ──────────────────────────────────────────────────────────────────────────
+  # wings-infer：控制容器
+  #   - 根据环境变量生成 start_command.sh 写入 shared-volume
+  #   - 提供 proxy(18000) 和 health(19000) 接口
+  # ──────────────────────────────────────────────────────────────────────────
+  wings-infer:
+    image: wings-infer:zhanghui-ascend-st
+    container_name: wings-infer-ascend-st
+    ports:
+      - "18000:18000"   # proxy（对外推理接口）
+      - "19000:19000"   # health（健康检查）
+    environment:
+      # ── 引擎配置 ──
+      ENGINE: "vllm_ascend"
+      ENGINE_PORT: "17000"
+      # ── 端口规划 ──
+      PORT: "18000"
+      HEALTH_PORT: "19000"
+      # ── 模型配置 ──
+      MODEL_NAME: "DeepSeek-R1-Distill-Qwen-1.5B"
+      MODEL_PATH: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+      # ── 硬件声明（无探测模式，由环境变量驱动） ──
+      WINGS_DEVICE: "ascend"
+      DEVICE: "ascend"
+      WINGS_DEVICE_COUNT: "1"
+      DEVICE_COUNT: "1"
+      # ── 推理参数 ──
+      INPUT_LENGTH: "4096"
+      OUTPUT_LENGTH: "1024"
+      GPU_MEMORY_UTILIZATION: "0.9"
+      ENABLE_CHUNKED_PREFILL: "false"
+      MAX_NUM_SEQS: "32"
+      TRUST_REMOTE_CODE: "true"
+      # ── 其他 ──
+      ENABLE_ACCEL: "false"
+      WINGS_SKIP_PID_CHECK: "true"
+      SHARED_VOLUME_PATH: "/shared-volume"
+    volumes:
+      - shared-volume:/shared-volume
+      - /mnt/cephfs/models:/models:ro
+    depends_on:
+      - vllm-ascend-engine
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # vllm-ascend-engine：推理引擎容器
+  #   - 等待 wings-infer 写入 start_command.sh
+  #   - 执行 start_command.sh（含 Ascend env + python3 vllm server）
+  #   - 只占用 NPU 0（ASCEND_VISIBLE_DEVICES=0），不影响其他工作负载
+  # ──────────────────────────────────────────────────────────────────────────
+  vllm-ascend-engine:
+    image: quay.io/ascend/vllm-ascend:v0.14.0rc1
+    container_name: vllm-ascend-engine-st
+    privileged: true      # 打通 /dev/davinci* 设备访问
+    command:
+      - /bin/bash
+      - -c
+      - |
+        # ── NPU 锁定：只使用 NPU 0，避免占用他人资源（NPU 4-11 已被占用）
+        export ASCEND_VISIBLE_DEVICES=0
+
+        echo "=== NPU info ==="
+        npu-smi info 2>/dev/null | head -20 || echo "npu-smi not available in container"
+
+        echo "=== Waiting for start_command.sh from wings-infer... ==="
+        while [ ! -f /shared-volume/start_command.sh ]; do
+          sleep 1
+        done
+
+        echo "=== start_command.sh found, content: ==="
+        cat /shared-volume/start_command.sh
+
+        echo "=== Executing start_command.sh ==="
+        cd /shared-volume
+        bash start_command.sh &
+        ENGINE_PID=$!
+
+        echo "=== Waiting for vllm-ascend engine on port 17000 ==="
+        WAIT_COUNT=0
+        while ! nc -z 127.0.0.1 17000 2>/dev/null; do
+          sleep 2
+          WAIT_COUNT=$((WAIT_COUNT + 1))
+          if ! kill -0 $$ENGINE_PID 2>/dev/null; then
+            echo "ERROR: vllm-ascend engine process died (PID=$ENGINE_PID)"
+            exit 1
+          fi
+          if [ $WAIT_COUNT -ge 300 ]; then
+            echo "ERROR: Timeout waiting for vllm-ascend engine (600s)"
+            exit 1
+          fi
+        done
+        echo "=== vllm-ascend engine is ready on port 17000 ==="
+
+        wait $ENGINE_PID
+        EXIT_CODE=$?
+        echo "Engine exited with code $EXIT_CODE"
+        exit $EXIT_CODE
+    environment:
+      ASCEND_VISIBLE_DEVICES: "0"
+    volumes:
+      - shared-volume:/shared-volume
+      - /mnt/cephfs/models:/models:ro

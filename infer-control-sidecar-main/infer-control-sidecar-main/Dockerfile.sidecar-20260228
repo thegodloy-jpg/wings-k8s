@@ -1,0 +1,37 @@
+# Dockerfile.sidecar-20260228
+# Wings-Infer 控制容器 — backend-20260228 版本
+# 新增特性：支持 sglang / mindie 多引擎，删除 api/ services/ 遗留代码
+# 构建命令：
+#   docker build -f Dockerfile.sidecar-20260228 -t wings-infer:zhanghui-20260228 .
+FROM python:3.10-slim
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# 安装系统依赖
+RUN apt-get update && apt-get install -y \
+    curl \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制依赖文件并安装
+COPY backend-20260228/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY backend-20260228/app ./app
+
+# 验证核心模块完整性
+RUN ls -la /app/app/ \
+    && test -d /app/app/core    && echo "✓ core/    存在" \
+    && test -d /app/app/engines && echo "✓ engines/ 存在" \
+    && test -d /app/app/config  && echo "✓ config/  存在"
+
+# 创建共享卷目录
+RUN mkdir -p /shared-volume
+
+EXPOSE 18000 19000
+
+CMD ["python", "-m", "app.main"]

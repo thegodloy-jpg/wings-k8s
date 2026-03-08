@@ -1,0 +1,60 @@
+﻿flowchart LR
+  A[Request A arrives t1] --> Q1
+  B[Request B arrives t2] --> Q1
+  C[Request C arrives t3] --> Q1
+
+  subgraph Q1[FCFS Queue: deque]
+    direction LR
+    H[Head] --> QA[A] --> QB[B] --> QC[C] --> T[Tail]
+  end
+
+  Q1 --> P1[Pop from head: A]
+  P1 --> P2[Next: B]
+  P2 --> P3[Next: C]
+
+---
+flowchart TB
+  A2[A: priority=5, arrival=10] --> H2
+  B2[B: priority=1, arrival=12] --> H2
+  C2[C: priority=1, arrival=11] --> H2
+
+  H2[Priority Queue: heapq min-heap] --> O1[Pop #1: C]
+  O1 --> O2[Pop #2: B]
+  O2 --> O3[Pop #3: A]
+
+  R[Ordering Rule] --> R1[1. lower priority first]
+  R --> R2[2. earlier arrival_time first]
+  R --> R3[3. smaller request_id tie-break]
+
+---
+flowchart TD
+  S[Start schedule step] --> R2[Schedule RUNNING requests first]
+  R2 --> W[Schedule WAITING requests]
+  W --> A3[Try allocate_slots for request]
+  A3 -->|success| M[Move request to RUNNING / continue execution]
+  A3 -->|fail: KV insufficient| P[Preempt one RUNNING request]
+  P --> Q[Put preempted request back to WAITING]
+  Q --> A3
+  M --> B3[Update token budget and stats]
+  B3 --> E[Emit scheduler output]
+
+---
+sequenceDiagram
+  participant Scheduler
+  participant WaitingQueue
+  participant KVManager
+  participant RunningList
+
+  Scheduler->>RunningList: Iterate RUNNING first
+  Scheduler->>WaitingQueue: Peek next waiting request
+  Scheduler->>KVManager: allocate_slots(request)
+  alt allocation success
+    KVManager-->>Scheduler: new blocks
+    Scheduler->>RunningList: append / keep running
+  else allocation fail
+    KVManager-->>Scheduler: None
+    Scheduler->>RunningList: select victim to preempt
+    Scheduler->>KVManager: free(victim)
+    Scheduler->>WaitingQueue: prepend(victim)
+  end
+  Scheduler-->>Scheduler: emit SchedulerOutput

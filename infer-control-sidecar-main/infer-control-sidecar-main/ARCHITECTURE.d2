@@ -1,0 +1,36 @@
+direction: right
+
+title: "Infer Control Sidecar 架构图（D2）"
+
+client: "客户端\n(业务调用方)"
+
+pod: {
+  label: "Kubernetes Pod: wings-infer"
+
+  sidecar: "Wings-Infer Sidecar\nFastAPI 控制层\n端口:9000"
+  routes: "API 路由\n/health\n/v1/completions\n/v1/chat/completions\n/generate"
+  em: "EngineManager\n启动与就绪判定"
+  cb: "CommandBuilder\n拼接引擎启动命令"
+  ps: "ProxyService + HTTPClient\n请求转发到引擎"
+  shared: "共享卷 /shared-volume\nstart_command.sh"
+  engine: "推理引擎容器\nvLLM 或 SGLang\n端口:8000"
+}
+
+client -> pod.sidecar: "HTTP 请求"
+pod.sidecar -> pod.routes: "路由分发"
+
+pod.sidecar -> pod.em: "容器启动时执行"
+pod.em -> pod.cb: "生成命令"
+pod.cb -> pod.shared: "写入脚本"
+pod.engine -> pod.shared: "读取并执行"
+pod.em -> pod.engine: "轮询 /health"
+
+pod.routes -> pod.em: "检查 engine_ready"
+pod.routes -> pod.ps: "就绪后转发"
+pod.ps -> pod.engine: "POST /v1/* /generate"
+pod.engine -> pod.ps: "推理结果"
+pod.ps -> pod.routes: "回传"
+pod.routes -> client: "返回响应"
+
+note: "核心职责:\n1) 控制引擎启动\n2) 统一对外 API\n3) 代理并转发请求"
+note -> pod.sidecar: "说明"

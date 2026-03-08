@@ -1,0 +1,172 @@
+# StatefulSet: vLLM + Ray 跨节点分布式推理 (NVIDIA GPU)
+# 架构: rank-0 = Ray Head + vLLM serve, rank-1 = Ray Worker
+#
+# ⚠️ 部署前必须修改标记为 CUSTOMIZE 的参数
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: infer
+spec:
+  serviceName: infer-hl
+  replicas: 2                              # CUSTOMIZE: 节点数
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infer-vllm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infer-vllm
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: infer-vllm
+              topologyKey: kubernetes.io/hostname
+
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      volumes:
+        - name: shared-volume
+          emptyDir: {}
+        - name: model-volume
+          hostPath:
+            path: /mnt/models                           # CUSTOMIZE: 模型存储路径
+            type: DirectoryOrCreate
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
+        # NVIDIA 设备节点 — k3s-in-Docker 中需显式挂载
+        - name: dev-nvidia0
+          hostPath:
+            path: /dev/nvidia0
+            type: CharDevice
+        - name: dev-nvidiactl
+          hostPath:
+            path: /dev/nvidiactl
+            type: CharDevice
+        - name: dev-nvidia-uvm
+          hostPath:
+            path: /dev/nvidia-uvm
+            type: CharDevice
+        - name: nvidia-libs
+          hostPath:
+            path: /mnt/nvidia-libs                      # CUSTOMIZE: NVIDIA 驱动库路径
+            type: Directory
+
+      containers:
+        # ---------- wings-infer sidecar ----------
+        - name: wings-infer
+          image: wings-infer:latest                      # CUSTOMIZE: sidecar 镜像
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 18000
+              name: proxy
+            - containerPort: 19000
+              name: health
+          env:
+            - name: DISTRIBUTED
+              value: "true"
+            - name: NNODES
+              value: "2"                                 # CUSTOMIZE: 节点数
+            - name: NODE_RANK
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+            - name: HEAD_NODE_ADDR
+              value: "CHANGE_ME"                         # CUSTOMIZE: rank-0 节点 IP
+            - name: NODE_IPS
+              value: "CHANGE_ME,CHANGE_ME"               # CUSTOMIZE: 所有节点 IP
+            - name: ENGINE
+              value: "vllm"
+            - name: DISTRIBUTED_EXECUTOR_BACKEND
+              value: "ray"
+            - name: TENSOR_PARALLEL_SIZE
+              value: "1"
+            - name: MODEL_NAME
+              value: "DeepSeek-R1-Distill-Qwen-1.5B"     # CUSTOMIZE: 模型名称
+            - name: MODEL_PATH
+              value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"  # CUSTOMIZE
+            - name: ENGINE_PORT
+              value: "17000"
+            - name: PORT
+              value: "18000"
+            - name: HEALTH_PORT
+              value: "19000"
+            - name: WINGS_SKIP_PID_CHECK
+              value: "true"
+            - name: BACKEND_URL
+              value: "http://127.0.0.1:17000"
+          volumeMounts:
+            - name: shared-volume
+              mountPath: /shared-volume
+            - name: model-volume
+              mountPath: /models
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 19000
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 72
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 19000
+            initialDelaySeconds: 240
+            periodSeconds: 30
+            failureThreshold: 5
+
+        # ---------- vllm engine ----------
+        - name: engine
+          image: vllm/vllm-openai:latest                 # CUSTOMIZE: 引擎镜像
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "[engine] Waiting for start_command.sh..."
+              while [ ! -f /shared-volume/start_command.sh ]; do sleep 2; done
+              echo "[engine] Executing..."
+              cd /shared-volume && bash start_command.sh
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "0"
+          volumeMounts:
+            - name: shared-volume
+              mountPath: /shared-volume
+            - name: model-volume
+              mountPath: /models
+              readOnly: true
+            - name: dev-nvidia0
+              mountPath: /dev/nvidia0
+            - name: dev-nvidiactl
+              mountPath: /dev/nvidiactl
+            - name: dev-nvidia-uvm
+              mountPath: /dev/nvidia-uvm
+            - name: nvidia-libs
+              mountPath: /mnt/nvidia-libs
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "24"
+              memory: "64Gi"

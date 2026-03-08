@@ -1,0 +1,71 @@
+# service-vllm-ascend-dist.yaml
+# 用途：ST 昇腾 vllm-ascend Ray 分布式验证 Service
+# 日期：2026-03-04
+# 目标：7.6.52.110（rank-0/infer-0）+ 7.6.52.170（rank-1/infer-1）
+# 配套：statefulset-vllm-ascend-dist.yaml
+# namespace：wings-verify-st-dist
+#
+# 注意：StatefulSet 使用 hostNetwork: true
+#   - Ray GCS 通信使用真实宿主机 IP（7.6.52.110 ↔ 7.6.52.170）
+#   - Headless Service 提供 infer-0.infer-hl DNS 名称（worker 连接 head 用）
+# ---------------------------------------------------------------------------
+
+# --- Namespace（与 mindie 共享同一 namespace，幂等 apply）---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wings-verify-st-dist
+  labels:
+    owner: zhanghui
+
+---
+# --- Headless Service：StatefulSet 所需，提供 Pod DNS 记录 ---
+# infer-0.infer-hl.wings-verify-st-dist.svc.cluster.local → rank-0 IP
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-hl-vllm
+  namespace: wings-verify-st-dist
+  labels:
+    app: infer-vllm-ascend-dist
+    owner: zhanghui
+spec:
+  clusterIP: None
+  selector:
+    app: infer-vllm-ascend-dist
+  ports:
+    - name: ray-gcs
+      port: 6379           # Ray GCS 端口（worker 连接 head 用）
+      targetPort: 6379
+    - name: vllm-api
+      port: 17000          # vllm serve HTTP API 端口
+      targetPort: 17000
+    - name: proxy
+      port: 18100          # wings proxy 端口（vllm 专用，避免与 mindie/18000 冲突）
+      targetPort: 18100
+    - name: health
+      port: 19100          # wings health 端口（vllm 专用，避免与 mindie/19000 冲突）
+      targetPort: 19100
+
+---
+# --- ClusterIP Service：对外暴露，只路由 rank-0（infer-0）的 HTTP 接口 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-api-vllm
+  namespace: wings-verify-st-dist
+  labels:
+    app: infer-vllm-ascend-dist
+    owner: zhanghui
+spec:
+  type: ClusterIP
+  selector:
+    app: infer-vllm-ascend-dist
+    statefulset.kubernetes.io/pod-name: infer-vllm-0
+  ports:
+    - name: proxy
+      port: 18100
+      targetPort: 18100
+    - name: health
+      port: 19100
+      targetPort: 19100

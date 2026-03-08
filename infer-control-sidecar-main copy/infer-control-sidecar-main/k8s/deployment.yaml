@@ -1,0 +1,158 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wings-infer
+  labels:
+    app: wings-infer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wings-infer
+  template:
+    metadata:
+      labels:
+        app: wings-infer
+    spec:
+      # 共享卷配置
+      volumes:
+        - name: shared-volume
+          emptyDir: {}  # 使用默认磁盘存储
+        - name: model-volume
+          hostPath:
+            path: /mnt/models  # 修改为实际模型存储路径
+            type: DirectoryOrCreate
+        - name: accel-volume
+          emptyDir: {}  # 使用默认磁盘存储
+
+      # 初始化容器：拷贝 accel 文件
+      initContainers:
+        - name: accel-init
+          image: wings-accel:latest  # 替换为实际的镜像地址
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              # 拷贝 accel 文件到共享卷
+              echo "Copying accel files to shared volume..."
+              cp -r /accel/* /accel-volume/
+              echo "Accel files copied successfully"
+          volumeMounts:
+            - name: accel-volume
+              mountPath: /accel-volume
+
+      containers:
+        # Wings-Infer 控制容器
+        - name: wings-infer
+          image: wings-infer:latest  # 替换为实际的镜像地址
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9000
+              name: http
+          env:
+            - name: ENGINE_TYPE
+              value: "vllm"
+            - name: ENGINE_PORT
+              value: "8000"
+            - name: WINGS_PORT
+              value: "9000"
+            - name: MODEL_NAME
+              value: "DeepSeek-R1-Distill-Qwen-1.5B"
+            - name: MODEL_PATH
+              value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+            - name: TP_SIZE
+              value: "1"
+            - name: MAX_MODEL_LEN
+              value: "8192"
+            - name: SERVICE_CLUSTER_IP
+              value: "10.255.128.184"
+            - name: NODE_PORT
+              value: "30483"
+            - name: NODE_IP
+              value: "90.90.161.168"
+            - name: ENABLE_ACCEL
+              value: "true"  # 设置为 true 启用加速，false 禁用
+          volumeMounts:
+            - name: shared-volume
+              mountPath: /shared-volume
+            - name: model-volume
+              mountPath: /models
+              readOnly: false
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 30
+
+        # 引擎容器 (vLLM)
+        - name: vllm-engine
+          image: vllm/vllm-openai:latest  # vLLM官方镜像
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              # 等待wings-infer写入启动命令
+              echo "Waiting for start command..."
+              while [ ! -f /shared-volume/start_command.sh ]; do
+                sleep 1
+              done
+
+              # 检查是否启用加速
+              if [ "$ENABLE_ACCEL" = "true" ]; then
+                echo "Accel is enabled, installing accel packages..."
+                cd /accel-volume
+                bash install.sh
+                echo "Accel packages installed successfully"
+              else
+                echo "Accel is disabled, skipping installation"
+              fi
+
+              # 读取并执行启动命令（后台运行）
+              echo "Start command found, executing..."
+              cd /shared-volume
+              bash start_command.sh &
+
+              # 等待引擎启动（监听端口）
+              echo "Waiting for engine to start on port 8000..."
+              while ! nc -z 127.0.0.1 8000 2>/dev/null; do
+                sleep 2
+              done
+              echo "Engine is listening on port 8000"
+
+              # 保持容器运行（HTTP健康检查将由wings-infer完成）
+              echo "Engine started successfully"
+              tail -f /dev/null
+          env:
+            - name: ENABLE_ACCEL
+              value: "true"  # 设置为 true 启用加速，false 禁用
+          volumeMounts:
+            - name: shared-volume
+              mountPath: /shared-volume
+            - name: model-volume
+              mountPath: /models
+              readOnly: false  # hostPath 一般不需要只读
+            - name: accel-volume
+              mountPath: /accel-volume
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+              nvidia.com/gpu: "1"  # 请求 1 个 GPU
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+              nvidia.com/gpu: "1"  # 限制使用 1 个 GPU

@@ -1,0 +1,334 @@
+"""
+=============================================================================
+ Launcher 主入口模块 (main.py)
+=============================================================================
+
+功能概述：
+    这是 sidecar 控制容器的主入口，负责整个推理服务的生命周期管理。
+    它不直接运行推理引擎，而是作为协调器完成以下三个核心职责：
+
+核心职责：
+    1. 参数解析与脚本生成
+       - 解析 CLI 启动参数和环境变量
+       - 结合端口规划（PortPlan）生成 engine 启动脚本
+       - 调用 build_launcher_plan() 完成配置合并和命令拼装
+
+    2. 启动脚本传递
+       - 将生成的 shell 脚本写入共享卷 (/shared-volume/start_command.sh)
+       - engine 容器通过挂载同一共享卷读取脚本并执行
+       - 实现跨容器的命令传递和参数同步
+
+    3. 子服务托管
+       - 启动并守护 proxy（反向代理）和 health（健康检查）两个 FastAPI 子服务
+       - 监控子进程状态，异常退出时自动拉起（守护进程模式）
+       - 处理系统信号（SIGINT/SIGTERM）实现优雅退出
+
+Sidecar 架构说明：
+    ┌─────────────────────────────────────────────────────────────┐
+    │                      K8s Pod                                │
+    │  ┌─────────────────────┐    ┌─────────────────────────────┐ │
+    │  │   Launcher 容器     │    │      Engine 容器            │ │
+    │  │  (wings-infer)      │    │  (vllm/sglang/mindie)       │ │
+    │  │                     │    │                             │ │
+    │  │  main.py ───────────┼────┼──> start_command.sh         │ │
+    │  │       ↓             │    │         ↓                   │ │
+    │  │  proxy:18000        │    │    engine:17000             │ │
+    │  │  health:19000       │    │                             │ │
+    │  └─────────────────────┘    └─────────────────────────────┘ │
+    │              ↑                          ↑                   │
+    │              └──────── 共享卷 ───────────┘                   │
+    │                   /shared-volume/                           │
+    └─────────────────────────────────────────────────────────────┘
+
+关键设计点：
+    - launcher 本身不直接启动推理引擎进程，避免跨容器进程管理的复杂性
+    - 通过共享卷传递脚本，实现 launcher 与 engine 容器的解耦
+    - 分布式场景下，只有 rank0 节点暴露 proxy，其他节点仅保留 health 服务
+
+使用方式：
+    # 作为模块运行
+    python -m app.main --model-name DeepSeek-R1 --model-path /weights
+
+    # 或通过 run() 函数调用
+    from app.main import run
+    sys.exit(run(['--model-name', 'MyModel', ...]))
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from threading import Event
+from typing import Sequence
+
+from app.config.settings import settings
+from app.core.port_plan import PortPlan, derive_port_plan
+from app.core.start_args_compat import parse_launch_args
+from app.core.wings_entry import build_launcher_plan
+from app.utils.file_utils import safe_write_file
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [launcher] %(message)s",
+)
+logger = logging.getLogger("wings-sidecar-launcher")
+
+
+@dataclass
+class ManagedProc:
+    """描述一个由 launcher 托管的子进程。
+
+    这个数据类封装了子进程的完整元数据，用于 launcher 的进程守护循环。
+    支持进程启动、停止、状态检查等生命周期操作。
+
+    Attributes:
+        name: 进程名称标识（如 'proxy'、'health'），用于日志和调试
+        argv: 进程启动命令行参数列表，第一个元素通常是 python 解释器路径
+        env:  进程环境变量字典，包含 BACKEND_URL、PORT 等运行时配置
+        proc: subprocess.Popen 实例，进程未启动时为 None
+
+    使用示例：
+        >>> proxy = ManagedProc(
+        ...     name='proxy',
+        ...     argv=['python', '-m', 'uvicorn', 'app.proxy.gateway:app'],
+        ...     env={'PORT': '18000', 'BACKEND_URL': 'http://127.0.0.1:17000'}
+        ... )
+        >>> _start(proxy)  # 启动进程
+        >>> _stop(proxy)   # 停止进程
+    """
+
+    name: str           # 进程名称标识，用于日志打印
+    argv: list[str]     # 命令行参数列表 [python, -m, uvicorn, ...]
+    env: dict[str, str] # 环境变量字典，继承自父进程并添加服务特定变量
+    proc: subprocess.Popen | None = None  # 实际的子进程句柄
+
+
+def _start(proc: ManagedProc) -> None:
+    """启动单个托管子进程。
+
+    使用 subprocess.Popen 创建子进程，继承当前进程的标准输入输出。
+    启动失败时仅记录错误日志，不抛出异常，允许守护循环继续尝试。
+
+    Args:
+        proc: 待启动的托管进程对象，启动后 proc.proc 将被设置为 Popen 实例
+
+    注意事项:
+        - 子进程使用指定的 env 字典作为环境变量，不会自动继承父进程变量
+        - 启动失败通常是由于命令不存在或权限不足，需检查 argv[0] 路径
+        - 启动成功后需要通过 poll() 检查进程是否正常运行
+    """
+    logger.info("[launcher] 启动子进程 %s: %s", proc.name, " ".join(proc.argv))
+    try:
+        # 使用 Popen 创建子进程，env 参数完全替换（非继承）父进程环境
+        proc.proc = subprocess.Popen(proc.argv, env=proc.env)
+    except OSError as e:
+        # OSError 通常表示可执行文件不存在或权限问题
+        logger.error("[launcher] 启动 %s 失败: %s", proc.name, e)
+
+
+def _stop(proc: ManagedProc) -> None:
+    """优雅停止托管子进程，必要时强制终止。
+
+    采用两阶段停止策略：
+    1. 首先发送 SIGTERM 信号请求优雅退出，等待最多 10 秒
+    2. 若进程未响应，发送 SIGKILL 强制终止，再等待 5 秒
+    3. 若仍未退出，放弃等待并记录警告（进程可能成为僵尸进程）
+
+    Args:
+        proc: 待停止的托管进程对象，停止后 proc.proc 将被置为 None
+
+    设计说明:
+        - 优先使用 terminate() (SIGTERM) 允许进程完成清理工作
+        - 超时后使用 kill() (SIGKILL) 确保进程被终止
+        - 在容器环境中，僵尸进程由 init 进程收割，影响较小
+    """
+    if not proc.proc:
+        return  # 进程从未启动或已被清理
+
+    # 检查进程是否仍在运行 (poll() 返回 None 表示运行中)
+    if proc.proc.poll() is None:
+        # 第一阶段：发送 SIGTERM 请求优雅退出
+        logger.info("[launcher] 发送 SIGTERM 到 %s (pid=%d)", proc.name, proc.proc.pid)
+        proc.proc.terminate()
+        try:
+            proc.proc.wait(timeout=10)  # 等待最多 10 秒
+        except subprocess.TimeoutExpired:
+            # 第二阶段：优雅退出超时，强制杀死
+            logger.warning("[launcher] %s 未响应 SIGTERM，发送 SIGKILL", proc.name)
+            proc.proc.kill()
+            try:
+                proc.proc.wait(timeout=5)  # 再等待 5 秒
+            except subprocess.TimeoutExpired:
+                # 极端情况：进程无法终止（内核级阻塞）
+                logger.warning("[launcher] %s 在 SIGKILL 后仍未退出，放弃等待", proc.name)
+    proc.proc = None  # 清理引用
+
+
+def _restart_if_needed(proc: ManagedProc) -> None:
+    """检查进程状态，必要时自动重启（守护进程模式）。
+
+    该函数在主循环中周期性调用，实现子进程的自动恢复：
+    - 进程从未启动 → 立即启动
+    - 进程正在运行 → 不做操作
+    - 进程已退出   → 记录退出码并重启
+
+    Args:
+        proc: 待检查的托管进程对象
+
+    设计说明:
+        - 无条件重启策略：任何退出（包括正常退出 code=0）都会触发重启
+        - 适用于需要持续运行的服务（proxy/health）
+        - 不实现退避策略，依赖上层 PROCESS_POLL_SEC 控制重启频率
+    """
+    if not proc.proc:
+        # 进程从未启动，直接启动
+        _start(proc)
+        return
+
+    # poll() 返回 None 表示进程仍在运行
+    code = proc.proc.poll()
+    if code is None:
+        return  # 进程正常运行，无需操作
+
+    # 进程已退出，记录并重启
+    logger.warning("[launcher] %s 以退出码 %s 退出，正在重启...", proc.name, code)
+    _start(proc)
+
+
+def _build_child_env(port_plan: PortPlan) -> dict[str, str]:
+    """为 proxy/health 子进程准备环境变量。"""
+    env = os.environ.copy()
+
+    # MindIE 分布式场景下，backend 可能绑定在节点 IP 上而不是 127.0.0.1。
+    # 因此这里优先根据 NODE_IPS/NODE_RANK 计算当前节点地址。
+    node_ips = os.getenv("NODE_IPS", "").split(",")
+    node_rank = int(os.getenv("NODE_RANK", "0"))
+    backend_host = (
+        node_ips[node_rank].strip()
+        if node_rank < len(node_ips) and node_ips[0]
+        else "127.0.0.1"
+    )
+
+    env["BACKEND_URL"] = f"http://{backend_host}:{port_plan.backend_port}"
+    env["BACKEND_HOST"] = backend_host
+    env["BACKEND_PORT"] = str(port_plan.backend_port)
+    env["PORT"] = str(port_plan.proxy_port)
+    env["PROXY_PORT"] = str(port_plan.proxy_port)
+    env["HEALTH_PORT"] = str(port_plan.health_port)
+    env["HEALTH_SERVICE_PORT"] = str(port_plan.health_port)
+    return env
+
+
+def _build_processes(port_plan: PortPlan) -> list[ManagedProc]:
+    """构造 launcher 需要托管的 proxy 与 health 进程。"""
+    env = _build_child_env(port_plan)
+    python_bin = settings.PYTHON_BIN
+    uvicorn_mod = settings.UVICORN_MODULE
+    return [
+        ManagedProc(
+            name="proxy",
+            argv=[
+                python_bin,
+                "-m",
+                uvicorn_mod,
+                settings.PROXY_APP,
+                "--host",
+                "0.0.0.0",
+                "--port",
+                str(port_plan.proxy_port),
+                "--log-level",
+                "info",
+            ],
+            env=env.copy(),
+        ),
+        ManagedProc(
+            name="health",
+            argv=[
+                python_bin,
+                "-m",
+                uvicorn_mod,
+                settings.HEALTH_APP,
+                "--host",
+                "0.0.0.0",
+                "--port",
+                str(port_plan.health_port),
+                "--log-level",
+                "info",
+            ],
+            env=env.copy(),
+        ),
+    ]
+
+
+def _write_start_command(script_text: str) -> str:
+    """将 engine 启动脚本写入共享卷。"""
+    shared_dir = settings.SHARED_VOLUME_PATH
+    os.makedirs(shared_dir, exist_ok=True)
+    path = os.path.join(shared_dir, settings.START_COMMAND_FILENAME)
+    ok = safe_write_file(path, script_text, is_json=False)
+    if not ok:
+        raise RuntimeError(f"failed to write start command: {path}")
+    logger.info("start command written: %s", path)
+    return path
+
+
+def run(argv: Sequence[str] | None = None) -> int:
+    """launcher 主流程。"""
+    launch_args = parse_launch_args(list(argv) if argv is not None else None)
+    port_plan = derive_port_plan(
+        port=launch_args.port,
+        enable_reason_proxy=settings.ENABLE_REASON_PROXY,
+        health_port=settings.HEALTH_PORT,
+    )
+
+    # 当前版本必须启用 proxy。
+    if not port_plan.enable_proxy:
+        logger.error("ENABLE_REASON_PROXY=false is not supported in v4 MVP")
+        return 2
+
+    launcher_plan = build_launcher_plan(launch_args, port_plan)
+    _write_start_command(launcher_plan.command)
+
+    processes = _build_processes(port_plan)
+    # 分布式场景下只有 rank0 暴露 proxy，其余 rank 保留 health 即可。
+    if getattr(launch_args, "node_rank", 0) > 0:
+        processes = [p for p in processes if p.name != "proxy"]
+
+    for proc in processes:
+        _start(proc)
+
+    stop_event = Event()
+
+    def _on_signal(signum: int, _frame: object) -> None:
+        logger.info("received signal: %s", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    logger.info(
+        "launcher running: backend=%s proxy=%s health=%s",
+        port_plan.backend_port,
+        port_plan.proxy_port,
+        port_plan.health_port,
+    )
+
+    try:
+        while not stop_event.is_set():
+            for proc in processes:
+                _restart_if_needed(proc)
+            time.sleep(settings.PROCESS_POLL_SEC)
+    finally:
+        for proc in processes:
+            _stop(proc)
+        logger.info("launcher shutdown complete")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run(sys.argv[1:]))

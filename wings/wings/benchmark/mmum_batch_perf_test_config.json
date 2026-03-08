@@ -1,0 +1,144 @@
+{
+  "model_type": "mmum",
+  "model_name": "Qwen2.5-VL-3B-Instruct",
+  "model_path": "/weights",
+  "service": {
+    "ip": "172.17.0.3",
+    "port": "18000",
+    "protocol": "http"
+  },
+  "test_parameters": {
+    "thread_num": 10,
+    "input_tokens_num": 128,
+    "output_tokens_num": 128,
+    "uniform_interval": 0,
+    "warmup_num": 1,
+    "image_height": 512,
+    "image_width": 512,
+    "image_count": 10
+  },
+  "files": {
+    "dataset_path": "",
+    "csv_file": "mmum_benchmark_results.csv",
+    "image_root": "./wings/benchmark/images"
+  },
+  "test_scenarios": [
+    {
+      "name": "TestNO-1",
+      "thread_num": 1,
+      "input_tokens_num": 128,
+      "output_tokens_num": 1024,
+      "image_height": 512,
+      "image_width": 512,
+      "image_count": 10
+    },
+    {
+      "name": "TestNO-2",
+      "thread_num": 32,
+      "input_tokens_num": 1024,
+      "output_tokens_num": 1024,
+      "image_height": 512,
+      "image_width": 512,
+      "image_count": 10
+    },
+    {
+      "name": "TestNO-3",
+      "thread_num": 32,
+      "input_tokens_num": 2048,
+      "output_tokens_num": 2048,
+      "image_height": 512,
+      "image_width": 512,
+      "image_count": 10
+    },
+    {
+      "name": "TestNO-4",
+      "thread_num": 32,
+      "input_tokens_num": 4096,
+      "output_tokens_num": 1024,
+      "image_height": 512,
+      "image_width": 512,
+      "image_count": 10
+    },
+    {
+      "name": "TestNO-5",
+      "thread_num": 64,
+      "input_tokens_num": 1024,
+      "output_tokens_num": 1024,
+      "image_height": 512,
+      "image_width": 512,
+      "image_count": 10
+    },
+    {
+      "name": "TestNO-6",
+      "thread_num": 64,
+      "input_tokens_num": 2048,
+      "output_tokens_num": 2048,
+      "image_height": 512,
+      "image_width": 512,
+      "image_count": 10
+    },
+    {
+      "name": "TestNO-7",
+      "thread_num": 64,
+      "input_tokens_num": 4096,
+      "output_tokens_num": 1024,
+      "image_height": 512,
+      "image_width": 512,
+      "image_count": 10
+    },
+    {
+      "name": "TestNO-8",
+      "thread_num": 128,
+      "input_tokens_num": 1024,
+      "output_tokens_num": 1024,
+      "image_height": 512,
+      "image_width": 512,
+      "image_count": 10
+    },
+    {
+      "name": "TestNO-9",
+      "thread_num": 128,
+      "input_tokens_num": 2048,
+      "output_tokens_num": 2048,
+      "image_height": 512,
+      "image_width": 512,
+      "image_count": 10
+    },
+    {
+      "name": "TestNO-10",
+      "thread_num": 128,
+      "input_tokens_num": 4096,
+      "output_tokens_num": 1024,
+      "image_height": 512,
+      "image_width": 512,
+      "image_count": 10
+    },
+    {
+      "name": "TestNO-11",
+      "thread_num": 256,
+      "input_tokens_num": 1024,
+      "output_tokens_num": 1024,
+      "image_height": 512,
+      "image_width": 512,
+      "image_count": 10
+    },
+    {
+      "name": "TestNO-12",
+      "thread_num": 256,
+      "input_tokens_num": 2048,
+      "output_tokens_num": 2048,
+      "image_height": 512,
+      "image_width": 512,
+      "image_count": 10
+    },
+    {
+      "name": "TestNO-13",
+      "thread_num": 256,
+      "input_tokens_num": 4096,
+      "output_tokens_num": 1024,
+      "image_height": 512,
+      "image_width": 512,
+      "image_count": 10
+    }
+  ]
+}

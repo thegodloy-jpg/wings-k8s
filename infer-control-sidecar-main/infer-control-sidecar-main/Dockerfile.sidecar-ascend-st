@@ -1,0 +1,27 @@
+# ─────────────────────────────────────────────────────────────────
+# wings-infer sidecar（Ascend ST 验证版）
+# 基于 backend-ascend-st 代码，支持 vllm_ascend / mindie 引擎
+# 目标运行环境：华为昇腾 910B2C (CANN 8.5.0)
+#
+# 构建命令（k3s-verify 规范：tag 必须含 zhanghui 字段）：
+#   docker build -f Dockerfile.sidecar-ascend-st \
+#     -t wings-infer:zhanghui-ascend-st .
+# 导入 k3s containerd：
+#   docker save wings-infer:zhanghui-ascend-st | \
+#     docker exec -i k3s-verify ctr images import -
+# ─────────────────────────────────────────────────────────────────
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# 安装依赖
+COPY backend-ascend-st/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY backend-ascend-st/app /app/app
+
+# 默认端口
+EXPOSE 18000 19000
+
+CMD ["python3", "-m", "app.main"]
