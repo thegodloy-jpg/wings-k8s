@@ -40,6 +40,20 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 class Settings(BaseSettings):
+    """全局配置类，集中管理 sidecar 运行时的所有可配置参数。
+
+    配置项涵盖：
+      - 共享卷路径与启动脚本文件名
+      - 引擎类型、主机和端口
+      - sidecar 三层端口规划（backend / proxy / health）
+      - 子服务启动入口（uvicorn 模块路径）
+      - 模型路径、TP 大小等引擎参数
+      - 历史兼容字段（健康检查、NodePort 等）
+
+    所有参数均通过环境变量驱动，支持 K8s ConfigMap/Secret 注入，
+    同时通过 pydantic-settings 自动加载 .env 文件用于本地开发。
+    本类在模块级别实例化为单例 ``settings``，进程内全局唯一。
+    """
     # 共享卷路径：launcher 在这里写 start_command.sh，engine 容器在这里读取。
     SHARED_VOLUME_PATH: str = os.getenv("SHARED_VOLUME_PATH", "/shared-volume")
     START_COMMAND_FILENAME: str = os.getenv("START_COMMAND_FILENAME", "start_command.sh")

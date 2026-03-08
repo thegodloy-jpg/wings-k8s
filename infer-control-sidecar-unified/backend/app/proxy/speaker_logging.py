@@ -60,7 +60,11 @@ import re  #  /health
 #
 # =========================
 class LogConstants:
-    """(no description)"""
+    """日志格式化与 speaker 决策相关的常量集合。
+
+    集中管理环境变量前缀、speaker 决策键名、默认 worker 数量
+    以及需要被归一化的 logger 名称列表，方便外部 patch 替换。
+    """
 
     #
     ENV_PREFIX = "LOG_"
@@ -97,7 +101,16 @@ _lg = logging.getLogger(__name__)
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
-    """ default"""
+    """读取环境变量并解析为布尔值，不存在或无法识别时返回默认值。
+
+    Args:
+        key: 环境变量名称。
+        default: 环境变量未设置或值无法识别时的默认返回值。
+
+    Returns:
+        解析后的布尔值。识别 '1/true/yes/y/on' 为 True，
+        '0/false/no/n/off' 为 False，其余返回 default。
+    """
     v = os.getenv(key, "")
     if v is None:
         return default
@@ -110,7 +123,15 @@ def _env_bool(key: str, default: bool = False) -> bool:
 
 
 def _env_int(key: str, default: int) -> int:
-    """ default"""
+    """读取环境变量并解析为整数，解析失败时返回默认值。
+
+    Args:
+        key: 环境变量名称。
+        default: 环境变量未设置或无法转换为整数时的默认返回值。
+
+    Returns:
+        解析后的整数值，解析异常时返回 default。
+    """
     try:
         return int(os.getenv(key, str(default)).strip())
     except Exception:
@@ -118,7 +139,17 @@ def _env_int(key: str, default: int) -> int:
 
 
 def _parse_csv_ints(s: str) -> List[int]:
-    """ '0,2,5' -> [0, 2, 5]"""
+    """将逗号分隔的数字字符串解析为整数列表。
+
+    非整数项会被忽略并记录警告日志。
+    示例: '0,2,5' -> [0, 2, 5]
+
+    Args:
+        s: 逗号分隔的数字字符串，如 '0,2,5'。
+
+    Returns:
+        解析成功的整数列表，无效项被跳过。
+    """
     out: List[int] = []
     for part in s.split(","):
         part = part.strip()
@@ -132,10 +163,15 @@ def _parse_csv_ints(s: str) -> List[int]:
 
 
 def _discover_worker_count() -> int:
-    """
-    1) LOG_WORKER_COUNT --workers
-    2) WEB_CONCURRENCY / UVICORN_WORKERS
-    3)  0
+    """自动发现当前部署的 worker 总数。
+
+    按以下优先级依次尝试:
+    1) 环境变量 LOG_WORKER_COUNT（手动指定，优先级最高）
+    2) WEB_CONCURRENCY / UVICORN_WORKERS（--workers 参数设置）
+    3) 均未配置时返回 0，由调用方决定回退策略
+
+    Returns:
+        检测到的 worker 数量；未检测到时返回 0。
     """
     # 1)
     n = _env_int("LOG_WORKER_COUNT", 0)
@@ -160,9 +196,16 @@ def _discover_worker_count() -> int:
 
 
 def _is_speaker_by_index(allowed_indexes: List[int], worker_index: Optional[int]) -> Optional[bool]:
-    """
-    LOG_SPEAKER_INDEXES WORKER_INDEX
-     None
+    """根据显式配置的 LOG_SPEAKER_INDEXES 和 WORKER_INDEX 判断当前 worker 是否为 speaker。
+
+    当 WORKER_INDEX 未设置时无法判断，返回 None 以便调用方回退到 PID-hash 策略。
+
+    Args:
+        allowed_indexes: 允许作为 speaker 的 worker 索引列表。
+        worker_index: 当前 worker 的索引；为 None 表示未设置。
+
+    Returns:
+        True/False 表示是否为 speaker；None 表示无法判断（缺少 WORKER_INDEX）。
     """
     if worker_index is None:
         return None
@@ -170,14 +213,18 @@ def _is_speaker_by_index(allowed_indexes: List[int], worker_index: Optional[int]
 
 
 def _is_speaker_by_pid_hash(pid: int, speakers_quota: int, worker_count: int) -> bool:
-    """
-     pid  crc32 worker_count
-     [0, speakers_quota)
+    """通过 PID 的 CRC32 哈希值对 worker_count 取模，判断当前进程是否为 speaker。
 
+    哈希结果落在 [0, speakers_quota) 区间内则为 speaker。
 
-    - speakers_quota worker  INFO 1
-    - worker_count worker <=0 max(8, speakers_quota)
-    -  worker_count PID /
+    Args:
+        pid: 当前进程的 PID。
+        speakers_quota: 允许输出 INFO 级别日志的 worker 数量，最小为 1。
+        worker_count: worker 总数；若 <=0 则回退为 max(8, speakers_quota)，
+                      确保在 worker 数未知时仍能合理分配。
+
+    Returns:
+        True 表示当前进程为 speaker，应输出 INFO 级别日志；否则 False。
     """
     speakers_quota = max(1, speakers_quota)
     if worker_count <= 0:
@@ -298,18 +345,22 @@ def _install_health_log_filters() -> None:
 
 
 def configure_worker_logging(force: bool = False) -> bool:
-    """
-     worker  worker  speakerINFO
-     FastAPI startup  force=False
+    """配置当前 worker 的日志级别，决定其是否为 speaker（输出 INFO 日志）。
 
+    应在 FastAPI/uvicorn 启动时调用，默认仅执行一次（force=False）。
+    执行流程:
+    1) 读取环境变量获取 speakers_quota、worker_count、access 日志策略
+    2) 通过 worker 索引匹配或 PID-hash 决定 speaker 身份
+    3) 确保 root logger 有 handler，配置 uvicorn.access 日志
+    4) 归一化子 logger，安装 /health 过滤器
+    5) 设置 root 日志级别：speaker=INFO，非 speaker=WARNING
+    6) 将决策结果写入 _SPEAKER_DECISION 环境变量供后续快速查询
 
-    1)
-    2) worker  access
-    3)  PID
-    4)  root handler uvicorn.access logger
-    5)  root =INFO=WARNING
-    6)  INFO
-    7)  _SPEAKER_DECISION
+    Args:
+        force: 是否强制重新配置。为 False 时若已配置过则直接返回缓存结果。
+
+    Returns:
+        True 表示当前 worker 为 speaker（INFO 级别），False 表示非 speaker（WARNING 级别）。
     """
     global _CONFIGURED_ONCE
     if _CONFIGURED_ONCE and not force:
@@ -378,11 +429,19 @@ def configure_worker_logging(force: bool = False) -> bool:
 #
 # =========================
 def _patch_worker_logging(constants: type = LogConstants) -> None:
-    """
+    """根据 LogConstants 中的常量对模块内部函数进行猴子补丁。
 
-    -  LogConstants.NORMALIZE_LOGGERS  _normalize_children
-    -  LogConstants.DEFAULT_WORKER_COUNT  _is_speaker_by_pid_hash  8
-    -  configure_worker_logging  SPEAKER_DECISION_ENV
+    使 _normalize_children、_is_speaker_by_pid_hash、configure_worker_logging
+    三个函数在运行时使用 constants 中定义的值，而非硬编码默认值。
+    这允许外部通过修改 LogConstants 来自定义行为。
+
+    补丁内容:
+    - _normalize_children: 使用 constants.NORMALIZE_LOGGERS 替代硬编码列表
+    - _is_speaker_by_pid_hash: 使用 constants.DEFAULT_WORKER_COUNT 替代默认值 8
+    - configure_worker_logging: 同步 constants.SPEAKER_DECISION_ENV 与内部键名
+
+    Args:
+        constants: 包含日志常量的类，默认为 LogConstants。
     """
     mod = sys.modules[__name__]
 

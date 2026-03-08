@@ -72,6 +72,14 @@ def get_local_ip():
 
 
 def get_node_ips():
+    """获取分布式推理集群中所有节点的 IP 地址列表。
+
+    从 NODE_IPS 环境变量读取，若值带有方括号则自动去除，
+    返回逗号分隔的 IP 字符串，供多节点分布式通信使用。
+
+    Returns:
+        str | None: 逗号分隔的节点 IP 字符串，未设置时返回 None
+    """
     node_ips = os.getenv('NODE_IPS')
     if node_ips and "[" in node_ips:
         node_ips = node_ips.replace("[", "").replace("]", "")
@@ -79,10 +87,13 @@ def get_node_ips():
 
 
 def get_server_port():
-    """SERVER_PORT
+    """获取推理服务监听端口。
+
+    从 SERVER_PORT 环境变量读取，将其转换为整数并返回。
+    若未设置或值非法（无法转为整数），则记录警告并返回 None。
 
     Returns:
-        int or None: None
+        int | None: 服务端口号，未设置或格式非法时返回 None
     """
     port = os.getenv('SERVER_PORT')
     if port:
@@ -94,10 +105,13 @@ def get_server_port():
 
 
 def get_master_port():
-    """MASTER_PORT
+    """获取分布式训练/推理主节点（Master）通信端口。
+
+    从 MASTER_PORT 环境变量读取，用于 Ray/HCCL 等分布式框架
+    初始化时指定主节点的通信端口。若未设置或值非法则返回 None。
 
     Returns:
-        int or None: None
+        int | None: 主节点端口号，未设置或格式非法时返回 None
     """
     port = os.getenv('MASTER_PORT')
     if port:
@@ -109,10 +123,13 @@ def get_master_port():
 
 
 def get_worker_port():
-    """WORKER_PORT
+    """获取工作节点（Worker）通信端口。
+
+    从 WORKER_PORT 环境变量读取，用于分布式推理场景下
+    Worker 节点的服务监听端口。若未设置或值非法则返回 None。
 
     Returns:
-        int or None: None
+        int | None: 工作节点端口号，未设置或格式非法时返回 None
     """
     port = os.getenv('WORKER_PORT')
     if port:
@@ -124,10 +141,13 @@ def get_worker_port():
 
 
 def get_vllm_distributed_port():
-    """VLLM_DISTRIBUTED_PORT
+    """获取 vLLM 分布式推理的 Ray Worker 通信端口。
+
+    从 VLLM_DISTRIBUTED_PORT 环境变量读取，用于 vLLM 多卡/多节点场景下
+    Ray Worker 之间的内部通信。若未设置或值非法则返回 None。
 
     Returns:
-        int or None: None
+        int | None: vLLM 分布式通信端口号，未设置或格式非法时返回 None
     """
     port = os.getenv('VLLM_DISTRIBUTED_PORT')
     if port:
@@ -139,10 +159,13 @@ def get_vllm_distributed_port():
 
 
 def get_sglang_distributed_port():
-    """SGLANG_DISTRIBUTED_PORT
+    """获取 SGLang 分布式推理通信端口。
+
+    从 SGLANG_DISTRIBUTED_PORT 环境变量读取，用于 SGLang 多节点分布式推理
+    场景下各节点之间的通信。若未设置或值非法则返回 None。
 
     Returns:
-        int or None: None
+        int | None: SGLang 分布式通信端口号，未设置或格式非法时返回 None
     """
     port = os.getenv('SGLANG_DISTRIBUTED_PORT')
     if port:
@@ -154,10 +177,13 @@ def get_sglang_distributed_port():
 
 
 def get_lmcache_env():
-    """LMCache
+    """检查 KVCache Offload（卸载到 CPU/磁盘）功能是否启用。
+
+    从 LMCACHE_OFFLOAD 环境变量读取，判断是否将 KVCache 卸载到
+    CPU 内存或本地磁盘以节省 GPU 显存。默认未启用。
 
     Returns:
-        str or bool: LMCACHE_OFFLOADFalse
+        bool: 启用返回 True，未设置或为 'false' 时返回 False
     """
     lmcache_offload = os.getenv('LMCACHE_OFFLOAD', 'false')
     lmcache_offload = lmcache_offload.lower() == 'true'
@@ -165,10 +191,13 @@ def get_lmcache_env():
 
 
 def get_qat_env():
-    """QAT
+    """检查 QAT（Quick Assist Technology）压缩功能是否启用。
+
+    从 LMCACHE_QAT 环境变量读取，判断是否对 LMCache 的 KVCache 数据
+    使用 QAT 硬件加速压缩。需配合 LMCache Offload 功能一起使用。
 
     Returns:
-        bool: LMCACHE_QATFalse
+        bool: 启用返回 True，未设置或为 'false' 时返回 False
     """
     qat = os.getenv('LMCACHE_QAT', 'false')
     qat = qat.lower() == 'true'
@@ -176,10 +205,15 @@ def get_qat_env():
 
 
 def get_pd_role_env():
-    """PD
+    """获取 PD 分离式推理（Disaggregated Inference）中的角色。
+
+    从 PD_ROLE 环境变量读取，返回当前节点在 Prefill-Decode 分离架构中的角色：
+    - "P"：Prefill 节点，负责预填充阶段
+    - "D"：Decode 节点，负责解码阶段
+    若未设置或值不合法则返回空字符串，表示未启用 PD 分离推理。
 
     Returns:
-        str: PD_ROLEP/D
+        str: 角色标识 "P" 或 "D"，未启用时返回空字符串
     """
     pd_role = os.getenv('PD_ROLE', '')
     if pd_role and pd_role not in ("P", "D"):
@@ -189,10 +223,13 @@ def get_pd_role_env():
 
 
 def get_router_env():
-    """
+    """检查 Wings Router（基于 NATS 的负载均衡路由）是否启用。
+
+    从 WINGS_ROUTE_ENABLE 环境变量读取，判断是否启用 Wings 平台的
+    推理请求路由功能，启用后请求将通过 NATS 进行负载均衡分发。
 
     Returns:
-        bool: WINGS_ROUTE_ENABLEFalse
+        bool: 启用返回 True，未设置或为 'false' 时返回 False
     """
     router = os.getenv('WINGS_ROUTE_ENABLE', 'false')
     router = router.lower() == 'true'
@@ -200,10 +237,13 @@ def get_router_env():
 
 
 def get_router_instance_group_name_env():
-    """WINGS_ROUTE_INSTANCE_GROUP_NAME
+    """获取 Wings Router 中当前实例所属的分组名称。
+
+    从 WINGS_ROUTE_INSTANCE_GROUP_NAME 环境变量读取，用于在 Wings Router
+    中标识该推理实例所属的逻辑分组，便于路由策略按组分发请求。
 
     Returns:
-        str: WINGS_ROUTE_INSTANCE_GROUP_NAME
+        str: 实例分组名称，未设置时返回空字符串
     """
     env_name = "WINGS_ROUTE_INSTANCE_GROUP_NAME"
     router_instance_group_name = os.getenv(env_name, '')
@@ -211,10 +251,13 @@ def get_router_instance_group_name_env():
 
 
 def get_router_instance_name_env():
-    """WINGS_ROUTE_INSTANCE_NAME
+    """获取 Wings Router 中当前推理实例的唯一标识名称。
+
+    从 WINGS_ROUTE_INSTANCE_NAME 环境变量读取，用于在 Wings Router
+    路由表中唯一标识当前推理服务实例。
 
     Returns:
-        str: WINGS_ROUTE_INSTANCE_NAMEE
+        str: 实例名称，未设置时返回空字符串
     """
     env_name = "WINGS_ROUTE_INSTANCE_NAME"
     router_instance_name = os.getenv(env_name, '')
@@ -222,10 +265,13 @@ def get_router_instance_name_env():
 
 
 def get_router_nats_path_env():
-    """WINGS_ROUTE_NATS_PATH
+    """获取 NATS 服务器的连接端点地址。
+
+    从 WINGS_ROUTE_NATS_PATH 环境变量读取，返回 NATS 消息服务器的
+    连接 URL，供 Wings Router 建立消息通信使用。
 
     Returns:
-        str: WINGS_ROUTE_NATS_PATH
+        str: NATS 服务器连接地址，未设置时返回空字符串
     """
     env_name = "WINGS_ROUTE_NATS_PATH"
     router_nats_path = os.getenv(env_name, '')
@@ -233,10 +279,13 @@ def get_router_nats_path_env():
 
 
 def get_operator_acceleration_env():
-    """operator_acceleration
+    """检查算子级加速（Operator Acceleration）是否启用。
+
+    从 ENABLE_OPERATOR_ACCELERATION 环境变量读取，判断是否启用
+    算子级别的推理加速优化（例如自定义 CUDA 算子内核等）。
 
     Returns:
-        bool: operator_acceleration
+        bool: 启用返回 True，未设置或为 'false' 时返回 False
     """
     operator_acceleration = os.getenv('ENABLE_OPERATOR_ACCELERATION', 'false')
     operator_acceleration = operator_acceleration.lower() == 'true'
@@ -244,10 +293,13 @@ def get_operator_acceleration_env():
 
 
 def get_soft_fp8_env():
-    """soft_fp8
+    """检查软件 FP8 量化是否启用。
+
+    从 ENABLE_SOFT_FP8 环境变量读取，判断是否启用软件模拟的
+    FP8（8-bit 浮点）量化，以降低显存占用并提升推理吞吐量。
 
     Returns:
-        bool: soft_fp8
+        bool: 启用返回 True，未设置或为 'false' 时返回 False
     """
     soft_fp8 = os.getenv('ENABLE_SOFT_FP8', 'false')
     soft_fp8 = soft_fp8.lower() == 'true'
@@ -255,10 +307,13 @@ def get_soft_fp8_env():
 
 
 def get_config_force_env():
-    """config_force
+    """检查是否强制使用用户提供的配置覆盖所有默认值。
+
+    从 CONFIG_FORCE 环境变量读取，当启用时，用户提供的推理引擎配置
+    将完全覆盖系统自动生成的默认配置参数。
 
     Returns:
-        bool: config_force
+        bool: 启用返回 True，未设置或为 'false' 时返回 False
     """
     config_force = os.getenv('CONFIG_FORCE', 'false')
     config_force = config_force.lower() == 'true'
@@ -266,7 +321,15 @@ def get_config_force_env():
 
 
 def log_kvcache_offload_config(lmcache_offload_enabled, qat_enabled):
-    """KVCache Offload"""
+    """记录 KVCache Offload 相关配置信息，用于调试和运维排查。
+
+    当 KVCache Offload 功能启用时，打印 CPU 内存、本地磁盘路径及大小限制
+    等配置项。若 QAT 压缩也启用，还会打印 QAT 损失级别和实例数等参数。
+
+    Args:
+        lmcache_offload_enabled (bool): KVCache Offload 是否启用
+        qat_enabled (bool): QAT 压缩是否启用
+    """
     if not lmcache_offload_enabled:
         return
 
@@ -285,13 +348,19 @@ def log_kvcache_offload_config(lmcache_offload_enabled, qat_enabled):
 
 
 def check_env():
-    """
+    """校验环境变量配置的一致性与合法性。
+
+    检查各环境变量之间的依赖关系是否满足，例如：
+    - 启用 QAT 压缩时必须同时启用 LMCache Offload
+    - 启用 QAT 时必须配置本地磁盘路径和大小
+    - 配置了 Wings Router 实例分组时必须同时设置实例名和 NATS 路径
+    校验通过前会先调用 log_kvcache_offload_config 记录配置详情。
 
     Raises:
-        ValueError: QATLMCache
+        ValueError: 当环境变量配置存在冲突或缺少必要依赖项时抛出
 
     Returns:
-        bool: truefalse
+        bool: 校验通过返回 True
     """
     qat = get_qat_env()
     lmcache_offload = get_lmcache_env()

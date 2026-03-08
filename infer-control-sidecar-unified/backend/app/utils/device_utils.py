@@ -87,6 +87,17 @@ def is_device_available(device: str) -> bool:
 
 
 def move_model_to_available_device(model):
+    """将模型迁移到当前可用的最优计算设备上。
+
+    按优先级自动选择设备（CUDA GPU > 昇腾 NPU > CPU）。
+    若最终可用设备为 CPU，则不执行迁移，直接返回原始模型。
+
+    Args:
+        model: PyTorch 模型实例，需支持 .to(device) 方法。
+
+    Returns:
+        迁移到目标设备后的模型实例。若设备为 CPU 则返回原始模型。
+    """
     device = get_available_device()
 
     if device == "cpu":
@@ -96,6 +107,18 @@ def move_model_to_available_device(model):
 
 
 def get_device_preferred_dtype(device: str) -> Union[torch.dtype, None]:
+    """根据设备类型返回推荐的数据精度（dtype）。
+
+    不同设备类型的推荐精度：
+    - CPU: float32（全精度，兼容性最佳）
+    - CUDA GPU / 昇腾 NPU: float16（半精度，推理性能更优）
+
+    Args:
+        device: 设备类型字符串，可选值为 'cuda'、'npu'、'cpu'。
+
+    Returns:
+        torch.dtype: 推荐的 PyTorch 数据类型。若设备类型不在已知范围内，返回 None。
+    """
     if device == "cpu":
         return torch.float32
     elif device == "cuda" or device == "npu":
@@ -105,10 +128,28 @@ def get_device_preferred_dtype(device: str) -> Union[torch.dtype, None]:
 
 
 def is_hf_accelerate_supported(device: str) -> bool:
+    """检查指定设备是否支持 HuggingFace Accelerate 库的加速特性。
+
+    目前仅 CUDA GPU 和昇腾 NPU 支持 Accelerate 加速，CPU 不支持。
+
+    Args:
+        device: 设备类型字符串，可选值为 'cuda'、'npu'、'cpu'。
+
+    Returns:
+        bool: 支持 Accelerate 返回 True，否则返回 False。
+    """
     return device == "cuda" or device == "npu"
 
 
 def empty_cache():
+    """清空 GPU/NPU 设备的显存缓存。
+
+    同时检查 CUDA 和昇腾 NPU 的可用性，并分别调用对应的缓存清理方法。
+    用于在模型卸载或推理完成后释放设备内存，降低 OOM 风险。
+
+    注意:
+        此操作不会释放被 PyTorch 张量占用的显存，仅释放缓存分配器中的空闲块。
+    """
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -117,6 +158,16 @@ def empty_cache():
 
 
 def get_available_device_env_name():
+    """获取当前可用设备对应的可见设备环境变量名。
+
+    映射关系：
+    - CUDA GPU -> 'CUDA_VISIBLE_DEVICES'
+    - 昇腾 NPU -> 'ASCEND_RT_VISIBLE_DEVICES'
+    - CPU -> None（CPU 无对应环境变量）
+
+    Returns:
+        str | None: 环境变量名称字符串，若当前设备为 CPU 则返回 None。
+    """
     return DEVICE_TO_ENV_NAME.get(get_available_device())
 
 
@@ -148,6 +199,24 @@ def gpu_count():
 
 
 def _get_nvidia_gpu_mem_info(gpu_id: int) -> Dict[str, float]:
+    """获取单张 NVIDIA GPU 的显存和利用率信息。
+
+    通过 pynvml 库查询指定 GPU 的设备名称、显存用量及 GPU 利用率。
+    此为内部方法，由 get_nvidia_gpu_info() 调用。
+
+    Args:
+        gpu_id: GPU 设备索引（从 0 开始）。
+
+    Returns:
+        Dict[str, float]: 包含以下字段的字典：
+            - device_id (int): 设备索引
+            - name (str): GPU 型号名称
+            - total_memory (int): 总显存（字节）
+            - used_memory (int): 已用显存（字节）
+            - free_memory (int): 空闲显存（字节）
+            - util (int): GPU 利用率百分比
+            - vendor (str): 厂商标识，固定为 'Nvidia'
+    """
     from pynvml import (
         nvmlDeviceGetHandleByIndex,
         nvmlDeviceGetMemoryInfo,
@@ -236,6 +305,24 @@ def get_nvidia_gpu_info() -> List[Dict[str, Any]]:
 
 
 def _get_npu_mem_info(npu_id: int) -> Dict[str, Any]:
+    """获取单张华为昇腾 NPU 的内存信息。
+
+    通过 torch_npu 库查询指定 NPU 的设备名称和内存用量。
+    此为内部方法，由 get_device_info() 调用。
+
+    Args:
+        npu_id: NPU 设备索引（从 0 开始）。
+
+    Returns:
+        Dict[str, Any]: 成功时包含以下字段的字典：
+            - device_id (int): 设备索引
+            - name (str): NPU 型号名称
+            - total_memory (int): 总内存（字节）
+            - used_memory (int): 已用内存（字节）
+            - free_memory (int): 空闲内存（字节）
+            - vendor (str): 厂商标识，固定为 'Ascend'
+        查询失败时返回 {"error": str}。
+    """
     try:
         import torch_npu
 
@@ -258,6 +345,26 @@ def _get_npu_mem_info(npu_id: int) -> Dict[str, Any]:
 
 
 def get_device_info() -> Dict[str, Any]:
+    """检测并汇总当前系统的计算设备信息。
+
+    自动识别设备类型（CUDA GPU / 昇腾 NPU / CPU），查询所有可用设备的
+    详细信息（型号、显存/内存用量等），并将内存单位从字节转换为 GB。
+
+    Returns:
+        Dict[str, Any]: 设备信息字典，结构如下：
+            {
+                "device": str,       # 设备类型 ('cuda' / 'npu' / 'cpu')
+                "count": int,        # 可用设备数量
+                "details": List[Dict],  # 每张设备的详细信息列表
+                "units": str,        # 内存单位，固定为 'GB'
+                "error": str         # （可选）出错时的错误信息
+            }
+
+    注意:
+        - CUDA 设备信息通过 pynvml 获取，包含利用率；
+        - NPU 设备信息通过 torch_npu 获取，不含利用率；
+        - 若设备类型不受支持或查询异常，result 中会包含 'error' 字段。
+    """
     device = get_available_device()
     base_count = 0
     device_key = "device"

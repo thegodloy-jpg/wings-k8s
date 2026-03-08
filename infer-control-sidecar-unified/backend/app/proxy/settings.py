@@ -114,6 +114,19 @@ RAG_ACC_ENABLED = os.getenv("RAG_ACC_ENABLED", "false").lower() != "false"
 
 
 def _split_strict(total: int, workers: int, idx: int) -> int:
+    """将全局配额严格均分给每个 worker。
+
+    使用整除 + 余数策略：前 ``total % workers`` 个 worker 各多分配 1，
+    保证所有 worker 的配额之和严格等于 total。
+
+    Args:
+        total: 全局总配额（如并发上限或队列容量）。
+        workers: worker 总数，若 <= 0 则直接返回 total。
+        idx: 当前 worker 索引（0-based），若不在 [0, workers) 范围内则返回 base 值。
+
+    Returns:
+        int: 当前 worker 分配到的本地配额。
+    """
     if workers <= 0:
         return total
     base = total // workers
@@ -123,6 +136,17 @@ def _split_strict(total: int, workers: int, idx: int) -> int:
     return base
 
 
+# ---------------------------------------------------------------------------
+# 排队和并发控制参数
+#
+# 设计思路：
+#   - 全局配额（GLOBAL_*）用于描述整个 Pod/容器级别的并发上限和队列容量。
+#   - 本地配额（LOCAL_*）通过 _split_strict() 将全局配额均分给每个 worker，
+#     避免多 worker 进程之间超发。
+#   - 双闸门模型（Gate-0 / Gate-1）用于分层流控：
+#       Gate-0: 零等待的快速通道（容量 = GATE0_LOCAL_CAP）
+#       Gate-1: 弹性缓冲通道（容量 = LOCAL_PASS_THROUGH_LIMIT - GATE0_LOCAL_CAP）
+# ---------------------------------------------------------------------------
 LOCAL_PASS_THROUGH_LIMIT = _split_strict(GLOBAL_PASS_THROUGH_LIMIT, WORKERS, WORKER_INDEX)
 LOCAL_QUEUE_MAXSIZE = _split_strict(GLOBAL_QUEUE_MAXSIZE, WORKERS, WORKER_INDEX)
 MAX_INFLIGHT = LOCAL_PASS_THROUGH_LIMIT
@@ -141,7 +165,12 @@ GATE_SOCK = os.getenv("GATE_SOCK", "")
 
 
 def log_boot_plan():
-    logger.info("Backend = %s", BACKEND_URL)
+    """在服务启动时输出当前生效的代理运行时配置摘要。
+
+    输出内容包括：后端地址、worker 布局、全局/本地并发参数、
+    闸门容量、HTTP/2 状态、重试策略及超时配置。
+    供运维人员在日志中快速确认配置是否符合预期。
+    """
     logger.info(
         "Plan: WORKERS=%s INDEX=%s | GLOBAL(inflight=%s, queue=%s) -> LOCAL(inflight=%s, queue=%s) | "
         "GATE0_TOTAL=%s -> G0_LOCAL=%s, G1_LOCAL=%s | HTTP2=%s H2_MAX_STREAMS=%s | "

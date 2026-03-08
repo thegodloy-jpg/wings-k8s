@@ -42,7 +42,19 @@ from . import settings as C
 
 
 def want_topk(name: str, default: str = "1") -> bool:
-    """topk"""
+    """根据环境变量判断是否启用 top-k 特性。
+
+    从环境变量中读取指定名称的值，按布尔语义解析：
+    '1'/'true' 视为启用，'0'/'false' 视为禁用，
+    其它值回退到 default 参数进行解析。
+
+    Args:
+        name: 环境变量名称。
+        default: 环境变量不存在时的默认字符串值，默认为 "1"（启用）。
+
+    Returns:
+        bool: 是否启用 top-k 特性。
+    """
     v = os.getenv(name, default)
     v = (v or "").strip().lower()
 
@@ -57,7 +69,17 @@ def want_topk(name: str, default: str = "1") -> bool:
 
 
 def want_stream(v: Any) -> bool:
-    """ stream=true"""
+    """判断请求是否要求流式响应。
+
+    将各种类型的输入统一解析为布尔值，用于决定是否以 SSE 流式方式返回推理结果。
+    支持 bool、int/float、以及字符串形式的真值（'1'/'true'/'yes'/'y'/'t'/'on'）。
+
+    Args:
+        v: 请求体中 stream 字段的原始值，可以是 bool / int / float / str 类型。
+
+    Returns:
+        bool: True 表示客户端请求流式响应，False 表示非流式。
+    """
     if isinstance(v, bool):
         return v
     if isinstance(v, (int, float)):
@@ -68,10 +90,19 @@ def want_stream(v: Any) -> bool:
 
 
 def make_upstream_headers(req: Request, want_gzip: bool = False) -> Dict[str, str]:
-    """
+    """构造转发到后端引擎的 HTTP 请求头。
 
-    -  Authorization / X-Request-Id
-    -  identity identity gzip  TTFT
+    从原始请求中提取需要透传的头部（Authorization、X-Request-Id），
+    并设置 content-type、accept-encoding、connection 等固定头部。
+
+    Args:
+        req: 客户端发来的原始 FastAPI Request 对象。
+        want_gzip: 是否在 accept-encoding 中使用 gzip。
+            默认使用 identity（不压缩），避免增加 TTFT 延迟。
+
+    Returns:
+        Dict[str, str]: 构建好的请求头字典，至少包含 content-type、
+            accept-encoding 和 connection 三个键。
     """
     h = {
         "content-type": "application/json",
@@ -88,11 +119,24 @@ def make_upstream_headers(req: Request, want_gzip: bool = False) -> Dict[str, st
 
 
 async def read_json_body(req: Request, rid: Optional[str], max_request_bytes: int) -> bytes:
-    """
-     JSON
-    - 413
-    -  JSON 400
-    -  bytes
+    """读取并校验请求体中的 JSON 数据。
+
+    依次执行以下检查：
+      1. 读取原始请求体字节。
+      2. 若 max_request_bytes > 0 且体积超限，返回 HTTP 413。
+      3. 尝试用 orjson 反序列化以验证 JSON 合法性，失败则返回 HTTP 400。
+
+    Args:
+        req: 客户端发来的 FastAPI Request 对象。
+        rid: 请求 ID，用于错误日志关联。
+        max_request_bytes: 请求体大小上限（字节），0 或负数表示不限制。
+
+    Returns:
+        bytes: 经过校验的原始 JSON 字节串（未修改内容）。
+
+    Raises:
+        HTTPException: 413 - 请求体超过大小限制。
+        HTTPException: 400 - 请求体不是合法 JSON。
     """
     body = await req.body()
     if max_request_bytes and len(body) > max_request_bytes:
@@ -134,9 +178,17 @@ def ms(sec: float) -> str:
 
 
 def _backend_origin() -> str:
-    """
-     BACKEND_URL  scheme://host[:port] path/query/fragment
-     origin
+    """从 BACKEND_URL 中提取 origin 部分（scheme://host[:port]）。
+
+    仅保留协议和主机端口，丢弃 path、query、fragment 等部分。
+    如果 BACKEND_URL 中包含路径组件，会输出警告日志。
+
+    Returns:
+        str: 格式为 ``scheme://netloc`` 的 origin 字符串，
+            例如 ``http://127.0.0.1:17000``。
+
+    Raises:
+        ValueError: 当 BACKEND_URL 缺少 scheme 或 netloc 时抛出。
     """
     u = urlsplit(C.BACKEND_URL.strip())
     if not u.scheme or not u.netloc:
@@ -147,10 +199,16 @@ def _backend_origin() -> str:
 
 
 def build_backend_url(path: str) -> str:
-    """
-     originscheme+host+port URL  URL
-    -  path  '/'
-    -  base_url  URL http://10.0.0.8:17000/v1/chat/completions
+    """拼接后端引擎的完整 URL。
+
+    将 origin（scheme+host+port）与指定 path 拼接成完整的后端请求 URL。
+    如果 path 不以 '/' 开头，会自动补全。
+
+    Args:
+        path: API 路径，例如 ``/v1/chat/completions``。
+
+    Returns:
+        str: 完整的后端 URL，例如 ``http://10.0.0.8:17000/v1/chat/completions``。
     """
     if not path.startswith("/"):
         path = "/" + path
@@ -158,9 +216,17 @@ def build_backend_url(path: str) -> str:
 
 
 def rebuild_request_json(req: Request, new_payload: Dict[str, Any]) -> Request:
-    """
-     payload  Request
-     scopereceive  body
+    """用新的 JSON payload 重建 Request 对象。
+
+    复制原始请求的 scope 并替换请求体内容，同时更新 content-length 头部
+    以匹配新 payload 的字节长度。返回一个全新的 Request 实例。
+
+    Args:
+        req: 原始的 FastAPI Request 对象。
+        new_payload: 新的请求体字典，将被序列化为 JSON。
+
+    Returns:
+        Request: 携带新 payload 的全新 Request 对象。
     """
     new_bytes = json.dumps(new_payload, ensure_ascii=False).encode("utf-8")
 
