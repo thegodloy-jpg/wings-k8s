@@ -19,15 +19,6 @@ Wings-Infer 通过 K8s Sidecar 双容器模式，实现对 vLLM、SGLang、MindI
 
 ```
 wings-k8s/
-├── wings/                              # 原始版 — 直接进程管理模式
-│   └── wings/
-│       ├── core/                       # 引擎管理器、配置加载器、硬件探测
-│       ├── engines/                    # 引擎适配器（vLLM/SGLang/MindIE/Wings）
-│       ├── distributed/               # 自建 Master-Worker 分布式框架
-│       ├── proxy/                      # OpenAI 兼容反向代理 + 健康检查
-│       ├── servers/                    # 自有推理服务（Transformers/HunyuanVideo）
-│       ├── benchmark/                  # 性能测试工具（TPS/TTFT）
-│       └── config/                     # 多层配置（硬件/引擎/环境变量）
 │
 ├── infer-control-sidecar-unified/      # 当前主版本 — K8s Sidecar 架构
 │   ├── backend/app/
