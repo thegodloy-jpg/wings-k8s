@@ -499,13 +499,13 @@ def build_start_script(params: Dict[str, Any]) -> str:
 
     # ── 4. ModelDeployConfig overrides ────────────────────────────────────
     model_deploy_overrides: Dict[str, Any] = {
-        "maxSeqLen": engine_config.get("maxSeqLen", 4096),
+        "maxSeqLen": engine_config.get("maxSeqLen", 2560),
         "maxInputTokenLen": engine_config.get("maxInputTokenLen", 2048),
         "truncation": engine_config.get("truncation", False),
     }
 
     # ── 5. ModelConfig[0] overrides ────────────────────────────────────────
-    world_size = engine_config.get("worldSize", nnodes if is_distributed else 1)
+    world_size = engine_config.get("worldSize", 8 if is_distributed else 1)
     model_config_overrides: Dict[str, Any] = {
         "modelName": engine_config.get("modelName", "default_llm"),
         "modelWeightPath": engine_config.get("modelWeightPath", ""),
@@ -541,6 +541,9 @@ def build_start_script(params: Dict[str, Any]) -> str:
         "maxPreemptCount": engine_config.get("maxPreemptCount", 0),
         "supportSelectBatch": engine_config.get("supportSelectBatch", False),
         "maxQueueDelayMicroseconds": engine_config.get("maxQueueDelayMicroseconds", 5000),
+        "bufferResponseEnabled": engine_config.get("bufferResponseEnabled", False),
+        "decodeExpectedTime": engine_config.get("decodeExpectedTime", 50),
+        "prefillExpectedTime": engine_config.get("prefillExpectedTime", 1500),
     }
 
     overrides_dict = {

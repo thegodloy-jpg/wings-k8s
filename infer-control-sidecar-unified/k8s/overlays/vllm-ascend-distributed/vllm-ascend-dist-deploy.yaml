@@ -20,8 +20,8 @@ spec:
     app.kubernetes.io/name: infer-vllm-ascend
   ports:
     - name: ray-gcs
-      port: 6379
-      targetPort: 6379
+      port: 28020
+      targetPort: 28020
     - name: engine
       port: 17000
       targetPort: 17000
@@ -129,14 +129,12 @@ spec:
               value: "1"
             - name: DISTRIBUTED
               value: "true"
-            - name: NNODES
-              value: "2"
-            - name: NODE_RANK
+            - name: MASTER_IP
+              value: "infer-0.infer-hl.wings-infer.svc.cluster.local"
+            - name: RANK_IP
               valueFrom:
                 fieldRef:
-                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
-            - name: HEAD_NODE_ADDR
-              value: "infer-0.infer-hl.wings-infer.svc.cluster.local"
+                  fieldPath: status.podIP
             - name: NODE_IPS
               value: "infer-0.infer-hl.wings-infer.svc.cluster.local,infer-1.infer-hl.wings-infer.svc.cluster.local"
             - name: ENGINE

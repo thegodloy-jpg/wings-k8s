@@ -56,27 +56,36 @@ Sidecar 架构说明：
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
+import threading
 from dataclasses import dataclass
 from threading import Event
 from typing import Sequence
 
 from app.config.settings import settings
 from app.core.port_plan import PortPlan, derive_port_plan
-from app.core.start_args_compat import parse_launch_args
+from app.core.start_args_compat import LaunchArgs, parse_launch_args
 from app.core.wings_entry import build_launcher_plan
+from app.utils.env_utils import get_local_ip, get_master_ip, get_node_ips
 from app.utils.file_utils import safe_write_file
+from app.utils.noise_filter import install_noise_filters
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] [launcher] %(message)s",
 )
 logger = logging.getLogger("wings-sidecar-launcher")
+
+# 安装噪声过滤器：抑制 /health 访问日志、batch 噪声、pynvml FutureWarning
+# 旧版 wings.py 在模块加载时调用，新版需在 launcher 入口显式调用
+install_noise_filters()
 
 
 @dataclass
@@ -204,15 +213,11 @@ def _build_child_env(port_plan: PortPlan) -> dict[str, str]:
     """为 proxy/health 子进程准备环境变量。"""
     env = os.environ.copy()
 
-    # MindIE 分布式场景下，backend 可能绑定在节点 IP 上而不是 127.0.0.1。
-    # 因此这里优先根据 NODE_IPS/NODE_RANK 计算当前节点地址。
-    node_ips = os.getenv("NODE_IPS", "").split(",")
-    node_rank = int(os.getenv("NODE_RANK", "0"))
-    backend_host = (
-        node_ips[node_rank].strip()
-        if node_rank < len(node_ips) and node_ips[0]
-        else "127.0.0.1"
-    )
+    # 后端地址：sidecar 与 engine 在同一 Pod 内共享网络命名空间。
+    # 分布式模式下 RANK_IP（Pod IP）可直接访问 engine；
+    # 单机/本地开发无 RANK_IP 时回退到 127.0.0.1。
+    rank_ip = os.getenv("RANK_IP")
+    backend_host = rank_ip if rank_ip else "127.0.0.1"
 
     env["BACKEND_URL"] = f"http://{backend_host}:{port_plan.backend_port}"
     env["BACKEND_HOST"] = backend_host
@@ -277,8 +282,360 @@ def _write_start_command(script_text: str) -> str:
     return path
 
 
+# ---------------------------------------------------------------------------
+# 分布式模式辅助函数
+# ---------------------------------------------------------------------------
+
+def _determine_role() -> str:
+    """判断当前 Pod 在分布式集群中的角色。
+
+    通过 DISTRIBUTED 环境变量判断是否为分布式模式:
+      - 非分布式 → "standalone"（沿用原有单机流程）
+      - 分布式且本机 IP == MASTER_IP → "master"
+      - 分布式且本机 IP != MASTER_IP → "worker"
+
+    注意：MASTER_IP 可能是 DNS 名称（如 K8s StatefulSet headless service），
+    因此比较前会尝试做 DNS 解析，避免因格式差异导致角色判断错误。
+
+    Returns:
+        "standalone" | "master" | "worker"
+    """
+    distributed = os.getenv("DISTRIBUTED", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if not distributed:
+        return "standalone"
+
+    master_ip = get_master_ip()
+    local_ip = get_local_ip()
+
+    if not master_ip:
+        logger.warning(
+            "DISTRIBUTED=true but MASTER_IP not set, falling back to standalone"
+        )
+        return "standalone"
+
+    # MASTER_IP 可能是 DNS 名称（如 "infer-0.infer-hl.svc.cluster.local"），
+    # 而 RANK_IP/local_ip 始终是数字 IP；需要解析后比较。
+    try:
+        master_resolved = socket.gethostbyname(master_ip)
+    except socket.error:
+        master_resolved = master_ip
+
+    try:
+        local_resolved = socket.gethostbyname(local_ip)
+    except socket.error:
+        local_resolved = local_ip
+
+    if local_resolved == master_resolved:
+        logger.info(
+            "Role determined: MASTER (local_ip=%s, master_ip=%s, resolved=%s)",
+            local_ip, master_ip, master_resolved,
+        )
+        return "master"
+
+    logger.info(
+        "Role determined: WORKER (local_ip=%s → %s, master_ip=%s → %s)",
+        local_ip, local_resolved, master_ip, master_resolved,
+    )
+    return "worker"
+
+
+def _get_expected_nodes() -> list[str]:
+    """从 NODE_IPS 环境变量获取集群全部节点 IP 列表。
+
+    若 NODE_IPS 未设置，回退到仅包含本机 IP 的单元素列表。
+    """
+    node_ips_str = get_node_ips()
+    if not node_ips_str:
+        return [get_local_ip()]
+    return [ip.strip() for ip in node_ips_str.split(",") if ip.strip()]
+
+
+def _override_distributed_args(
+    launch_args: LaunchArgs,
+    *,
+    distributed: bool,
+    nnodes: int,
+    node_rank: int,
+    head_node_addr: str,
+) -> LaunchArgs:
+    """创建 LaunchArgs 副本，覆盖分布式相关字段。
+
+    由于 LaunchArgs 是 frozen dataclass，使用 dataclasses.replace 创建变体。
+    """
+    return dataclasses.replace(
+        launch_args,
+        distributed=distributed,
+        nnodes=nnodes,
+        node_rank=node_rank,
+        head_node_addr=head_node_addr,
+    )
+
+
+def _load_distributed_config() -> dict:
+    """加载 config/distributed_config.json 配置。"""
+    import json
+    from pathlib import Path
+
+    config_path = Path(__file__).parent / "config" / "distributed_config.json"
+    with open(config_path) as f:
+        return json.load(f)
+
+
+def _wait_and_distribute_to_workers(
+    node_ips: list[str],
+    launch_args: LaunchArgs,
+    master_url: str,
+) -> None:
+    """后台线程：等待所有 Worker 注册后向其分发引擎启动指令。
+
+    流程:
+      1. 轮询 Master /api/nodes 接口，等待所有 worker 节点就绪（最多 5 分钟）
+      2. 注册完成后，逐个向 worker 的 /api/start_engine 发送启动请求
+      3. 为每个 worker 注入正确的 nnodes / node_rank / head_node_addr
+
+    Args:
+        node_ips:    全部节点 IP 列表（index 0 = master/rank0）
+        launch_args: 标准化启动参数
+        master_url:  Master API 地址（用于查询节点注册情况）
+    """
+    import requests as _requests
+
+    dist_config = _load_distributed_config()
+    worker_port = int(
+        os.getenv("WORKER_PORT", str(dist_config["workers"]["port"]))
+    )
+
+    worker_ips = node_ips[1:]  # 排除 rank 0（Master 自身已处理）
+    if not worker_ips:
+        logger.info("No worker nodes to distribute to (single-node distributed)")
+        return
+
+    # ---- 等待所有 Worker 注册到 Master ----
+    max_wait_sec = 300
+    poll_interval = 5
+    start_time = time.time()
+
+    while time.time() - start_time < max_wait_sec:
+        try:
+            resp = _requests.get(f"{master_url}/api/nodes", timeout=10)
+            resp.raise_for_status()
+            registered = {n["ip"] for n in resp.json().get("nodes", [])}
+            if all(ip in registered for ip in worker_ips):
+                logger.info(
+                    "All %d worker nodes registered with master",
+                    len(worker_ips),
+                )
+                break
+        except Exception as exc:
+            logger.debug("Waiting for workers to register: %s", exc)
+        time.sleep(poll_interval)
+    else:
+        logger.error(
+            "Timed out (%ds) waiting for worker registration. Expected: %s",
+            max_wait_sec,
+            worker_ips,
+        )
+        return
+
+    # ---- 向每个 Worker 分发启动指令 ----
+    nnodes = len(node_ips)
+    head_addr = node_ips[0]
+    base_params = launch_args.to_namespace().__dict__
+
+    for rank, worker_ip in enumerate(worker_ips, start=1):
+        params = {
+            **base_params,
+            "distributed": True,
+            "nnodes": nnodes,
+            "node_rank": rank,
+            "head_node_addr": head_addr,
+        }
+        try:
+            resp = _requests.post(
+                f"http://{worker_ip}:{worker_port}/api/start_engine",
+                json={"engine": params.get("engine", "vllm"), "params": params},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            logger.info(
+                "Distributed start command to worker rank %d (%s): %s",
+                rank,
+                worker_ip,
+                resp.json(),
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to distribute to worker rank %d (%s): %s",
+                rank,
+                worker_ip,
+                exc,
+            )
+
+
+def _run_master_mode(
+    launch_args: LaunchArgs,
+    port_plan: PortPlan,
+) -> int:
+    """Master 模式主流程。
+
+    1. 生成 rank 0 引擎启动脚本并写入共享卷 → engine 容器自动执行
+    2. 后台启动 Master FastAPI 协调服务（端口来自 distributed_config.json）
+    3. 启动 proxy + health 子服务
+    4. 后台等待 Worker 注册完成后分发启动指令到各 Worker
+    5. 进入守护循环，监控 proxy/health 子进程状态
+    """
+    local_ip = get_local_ip()
+    node_ips = _get_expected_nodes()
+    nnodes = len(node_ips)
+
+    # ---- 1. 生成 rank 0 脚本写入共享卷 ----
+    master_args = _override_distributed_args(
+        launch_args,
+        distributed=True,
+        nnodes=nnodes,
+        node_rank=0,
+        head_node_addr=local_ip,
+    )
+    launcher_plan = build_launcher_plan(master_args, port_plan)
+    _write_start_command(launcher_plan.command)
+
+    # ---- 2. 后台启动 Master FastAPI ----
+    dist_config = _load_distributed_config()
+    master_port = int(
+        os.getenv("MASTER_PORT", str(dist_config["master"]["port"]))
+    )
+    master_url = f"http://127.0.0.1:{master_port}"
+
+    def _run_master_api():
+        import uvicorn
+        from app.distributed.master import app as master_app
+
+        uvicorn.run(master_app, host="0.0.0.0", port=master_port)
+
+    master_thread = threading.Thread(target=_run_master_api, daemon=True)
+    master_thread.start()
+    logger.info("Master API starting on port %d", master_port)
+    time.sleep(2)  # 等待 Master FastAPI 就绪
+
+    # ---- 3. 启动 proxy + health 子服务 ----
+    processes = _build_processes(port_plan)
+    for proc in processes:
+        _start(proc)
+
+    # ---- 4. 后台等待 Worker 注册并分发 ----
+    dist_thread = threading.Thread(
+        target=_wait_and_distribute_to_workers,
+        args=(node_ips, launch_args, master_url),
+        daemon=True,
+    )
+    dist_thread.start()
+
+    # ---- 5. 守护循环 ----
+    stop_event = Event()
+
+    def _on_signal(signum: int, _frame: object) -> None:
+        logger.info("received signal: %s", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    logger.info(
+        "Master mode running: master_api=%d backend=%d proxy=%d health=%d",
+        master_port,
+        port_plan.backend_port,
+        port_plan.proxy_port,
+        port_plan.health_port,
+    )
+
+    try:
+        while not stop_event.is_set():
+            for proc in processes:
+                _restart_if_needed(proc)
+            time.sleep(settings.PROCESS_POLL_SEC)
+    finally:
+        for proc in processes:
+            _stop(proc)
+        logger.info("Master mode shutdown complete")
+    return 0
+
+
+def _run_worker_mode(
+    launch_args: LaunchArgs,
+    port_plan: PortPlan,
+) -> int:
+    """Worker 模式主流程。
+
+    1. 后台启动 Worker FastAPI 服务（自动向 Master 注册 + 心跳守护）
+    2. 仅启动 health 子服务（非 rank0 不暴露 proxy）
+    3. 进入守护循环
+    4. 引擎启动脚本由 Master 分发后通过 Worker API 写入共享卷
+
+    注意:
+      Worker 启动时不写 start_command.sh。脚本在 Master 完成分发后由
+      Worker 的 /api/start_engine 端点生成并写入共享卷。
+    """
+    master_ip = get_master_ip()
+
+    # ---- 1. 后台启动 Worker FastAPI ----
+    def _run_worker_api():
+        from app.distributed.worker import WorkerConfig, start_worker
+
+        worker_cfg = WorkerConfig(master_ip=master_ip)
+        start_worker(worker_cfg)
+
+    worker_thread = threading.Thread(target=_run_worker_api, daemon=True)
+    worker_thread.start()
+    logger.info("Worker API starting, registering with master at %s", master_ip)
+    time.sleep(2)  # 等待 Worker 就绪
+
+    # ---- 2. 仅启动 health 子服务（非 rank0 不需要 proxy） ----
+    processes = [p for p in _build_processes(port_plan) if p.name == "health"]
+    for proc in processes:
+        _start(proc)
+
+    # ---- 3. 守护循环 ----
+    stop_event = Event()
+
+    def _on_signal(signum: int, _frame: object) -> None:
+        logger.info("received signal: %s", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    logger.info(
+        "Worker mode running: health=%d "
+        "(waiting for master to dispatch engine start)",
+        port_plan.health_port,
+    )
+
+    try:
+        while not stop_event.is_set():
+            for proc in processes:
+                _restart_if_needed(proc)
+            time.sleep(settings.PROCESS_POLL_SEC)
+    finally:
+        for proc in processes:
+            _stop(proc)
+        logger.info("Worker mode shutdown complete")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 主入口
+# ---------------------------------------------------------------------------
+
 def run(argv: Sequence[str] | None = None) -> int:
-    """launcher 主流程。"""
+    """launcher 主流程。
+
+    根据 _determine_role() 判断角色:
+      - standalone: 沿用原有单机流程（build_launcher_plan → 写脚本 → 守护 proxy/health）
+      - master:     Master 协调模式（写 rank0 脚本 + Master API + 分发 Worker）
+      - worker:     Worker 等待模式（Worker API + 仅 health，等 Master 分发脚本）
+    """
     launch_args = parse_launch_args(list(argv) if argv is not None else None)
     port_plan = derive_port_plan(
         port=launch_args.port,
@@ -291,6 +648,16 @@ def run(argv: Sequence[str] | None = None) -> int:
         logger.error("ENABLE_REASON_PROXY=false is not supported in v4 MVP")
         return 2
 
+    # ---- 分布式角色分支 ----
+    role = _determine_role()
+    logger.info("Launcher role: %s", role)
+
+    if role == "master":
+        return _run_master_mode(launch_args, port_plan)
+    if role == "worker":
+        return _run_worker_mode(launch_args, port_plan)
+
+    # ---- standalone 模式（原有逻辑不变） ----
     launcher_plan = build_launcher_plan(launch_args, port_plan)
     _write_start_command(launcher_plan.command)
 

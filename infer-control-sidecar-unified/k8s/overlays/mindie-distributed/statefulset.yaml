@@ -1,4 +1,5 @@
 # StatefulSet: MindIE 跨节点分布式推理 (Ascend NPU + HCCL)
+# 分布式参数 (nnodes/node_rank/head_node_addr) 由 Master 自动计算注入
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -83,14 +84,12 @@ spec:
               value: "1"
             - name: DISTRIBUTED
               value: "true"
-            - name: NNODES
-              value: "2"                                 # CUSTOMIZE
-            - name: NODE_RANK
+            - name: MASTER_IP
+              value: "CHANGE_ME"                         # CUSTOMIZE: Master 节点 IP
+            - name: RANK_IP
               valueFrom:
                 fieldRef:
-                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
-            - name: HEAD_NODE_ADDR
-              value: "CHANGE_ME"                         # CUSTOMIZE
+                  fieldPath: status.podIP
             - name: NODE_IPS
               value: "CHANGE_ME,CHANGE_ME"               # CUSTOMIZE
             - name: ENGINE

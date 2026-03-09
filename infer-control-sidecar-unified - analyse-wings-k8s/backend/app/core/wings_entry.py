@@ -168,9 +168,9 @@ def build_launcher_plan(launch_args: LaunchArgs, port_plan: PortPlan) -> Launche
     known_args = launch_args.to_namespace()
     merged = load_and_merge_configs(hardware_env=hardware, known_args=known_args)
 
-    # 显式启动参数优先级最高，覆盖配置合并阶段的推断值。
-    engine = launch_args.engine
-    merged["engine"] = engine
+    # engine 已在 load_and_merge_configs 中经过 _auto_select_engine 的
+    # 自动选择、校验和升级（如 vllm → vllm_ascend），不可用原始值覆盖。
+    engine = merged.get("engine", launch_args.engine)
     merged["model_name"] = launch_args.model_name
     merged["model_path"] = launch_args.model_path
 

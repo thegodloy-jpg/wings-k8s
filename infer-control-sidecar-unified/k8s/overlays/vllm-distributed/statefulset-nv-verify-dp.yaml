@@ -72,16 +72,16 @@ spec:
         env:
         - name: DISTRIBUTED
           value: "true"
-        - name: NNODES
-          value: "2"
-        - name: NODE_RANK
-          value: "0"
-        - name: HEAD_NODE_ADDR
+        - name: MASTER_IP
           # head 绑定 bridge IP 172.17.0.3；.148 物理机 iptables DNAT: 7.6.52.148:13355 → 172.17.0.3:13355
           value: "172.17.0.3"
+        - name: RANK_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
         - name: NODE_IPS
           # 仅填 head 的 IP（1个条目），使 n_nodes=1 → tensor_parallel_size=device_count=1
-          # dp_deployment 模式不使用 NODE_IPS 进行分布式通信（依赖 HEAD_NODE_ADDR:13355）
+          # dp_deployment 模式不使用 NODE_IPS 进行分布式通信（依赖 MASTER_IP:13355）
           value: "7.6.52.148"
         - name: ENGINE
           value: vllm
@@ -226,13 +226,13 @@ spec:
         env:
         - name: DISTRIBUTED
           value: "true"
-        - name: NNODES
-          value: "2"
-        - name: NODE_RANK
-          value: "1"
-        - name: HEAD_NODE_ADDR
+        - name: MASTER_IP
           # worker 通过物理 IP 连接到 head：7.6.52.148:13355（.148 物理机 iptables → 172.17.0.3:13355）
           value: "7.6.52.148"
+        - name: RANK_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
         # NODE_IPS 只填本节点 IP → n_nodes=1 → TP=device_count=1
         - name: NODE_IPS
           value: "7.6.16.150"

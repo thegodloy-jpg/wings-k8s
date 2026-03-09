@@ -502,7 +502,7 @@ async def _send_stream_request(
         httpx.Response: 后端返回的流式 HTTP 响应对象。
     """
     return await _send_with_fixed_retries(
-        client, "POST", url,
+        client, "POST", build_backend_url(upstream_path),
         content=body_bytes,
         headers={k: v for k, v in req.headers.items() if k.lower() != "host"},
         stream=True,

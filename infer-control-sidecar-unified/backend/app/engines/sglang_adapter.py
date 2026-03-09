@@ -137,6 +137,9 @@ def _build_sglang_cmd_parts(params: Dict[str, Any]) -> str:
             continue
 
         arg_name = f"--{arg.replace('_', '-')}"
+        # 参数去重：跳过已存在的 CLI 参数，防止分布式参数与 engine_config 冲突
+        if arg_name in cmd_parts:
+            continue
 
         if isinstance(value, bool):
             if value:
@@ -186,8 +189,12 @@ def build_start_command(params: Dict[str, Any]) -> str:
         if ":" in head_node_addr:
             cmd += f" --dist-init-addr {head_node_addr}"
         else:
-            sglang_dist_port = os.getenv("SGLANG_DIST_PORT", "28030")
+            # dist_port: params 优先（config_loader 从 distributed_config.json 注入），其次环境变量
+            sglang_dist_port = str(params.get("dist_port", os.getenv("SGLANG_DIST_PORT", "28030")))
             cmd += f" --dist-init-addr {head_node_addr}:{sglang_dist_port}"
+        # 非 master 节点需要绑定所有地址（对齐 A）
+        if node_rank != 0:
+            cmd += " --host 0.0.0.0"
 
     return cmd
 
@@ -213,6 +220,16 @@ def build_start_script(params: Dict[str, Any]) -> str:
 
     lines: List[str] = []
     lines.extend(env_cmds)
+
+    # 分布式通信环境变量（对齐 A：GLOO/TP/NCCL_SOCKET_IFNAME）
+    is_distributed = params.get("distributed", False)
+    nnodes = params.get("nnodes", 1)
+    if is_distributed and nnodes > 1:
+        net_if = os.getenv("NETWORK_INTERFACE", os.getenv("GLOO_SOCKET_IFNAME", "eth0"))
+        lines.append(f"export GLOO_SOCKET_IFNAME={net_if}")
+        lines.append(f"export TP_SOCKET_IFNAME={net_if}")
+        lines.append(f"export NCCL_SOCKET_IFNAME={net_if}")
+
     lines.append(f"exec {core_cmd}")
     return "\n".join(lines) + "\n"
 

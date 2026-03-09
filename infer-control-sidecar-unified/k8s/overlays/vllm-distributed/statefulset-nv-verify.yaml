@@ -63,14 +63,12 @@ spec:
         env:
         - name: DISTRIBUTED
           value: "true"
-        - name: NNODES
-          value: "2"
-        - name: NODE_RANK
+        - name: MASTER_IP
+          value: "7.6.52.148"
+        - name: RANK_IP
           valueFrom:
             fieldRef:
-              fieldPath: "metadata.labels['apps.kubernetes.io/pod-index']"
-        - name: HEAD_NODE_ADDR
-          value: "7.6.52.148"
+              fieldPath: status.podIP
         - name: NODE_IPS
           value: "7.6.52.148,7.6.16.150"
         - name: ENGINE

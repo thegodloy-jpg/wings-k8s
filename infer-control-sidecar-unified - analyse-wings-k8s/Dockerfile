@@ -34,7 +34,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/app ./app
 COPY wings_start.sh ./wings_start.sh
-RUN chmod +x ./wings_start.sh
+RUN sed -i 's/\r//' ./wings_start.sh && chmod +x ./wings_start.sh
 
 RUN ls -la /app/app/ \
  && test -d /app/app/core    && echo "core/ OK" \

@@ -274,6 +274,11 @@ def _set_cuda_graph_sizes(params, ctx, model_info):
 
     在共享显存（MIG/虚拟 GPU）场景下，需要根据可用显存和模型层数推算最优
     CUDA Graph 捕获批次大小上限，避免 CUDA Graph 构建过多导致显存溢出。
+
+    显存获取优先级：
+      1. device_details[0]["total_memory"] — 运行时检测
+      2. WINGS_DEVICE_MEMORY 环境变量 — K8s 部署模板注入（单位 GB，整数或小数）
+      3. 硬编码 fallback 12 GB
     """
     if ctx["gpu_usage_mode"] != "full" and ctx["model_type"] == "llm":
         if ctx["device_details"] and ctx["device_details"][0]:
@@ -282,8 +287,17 @@ def _set_cuda_graph_sizes(params, ctx, model_info):
                 total_memory = 12
                 logger.warning("total_memory is None in device details, defaulting to 12G")
         else:
-            total_memory = 12
-            logger.warning("Can't get device details, will set total_memroy to 12G")
+            mem_env = os.getenv("WINGS_DEVICE_MEMORY", "").strip()
+            if mem_env:
+                try:
+                    total_memory = float(mem_env)
+                    logger.info("Using WINGS_DEVICE_MEMORY=%s GB for cuda-graph-sizes", total_memory)
+                except ValueError:
+                    total_memory = 12
+                    logger.warning("Invalid WINGS_DEVICE_MEMORY='%s', fallback to 12GB", mem_env)
+            else:
+                total_memory = 12
+                logger.warning("Can't get device details and WINGS_DEVICE_MEMORY not set, fallback to 12GB")
         max_capture_size = int(total_memory / 64 * 2048 - 256)
         max_num_batch_sizes = math.floor(
             max_capture_size / (model_info.num_hidden_layers + 1) / 2)
@@ -659,7 +673,16 @@ def _merge_configs(*configs: Dict[str, Any]) -> Dict[str, Any]:
 def _load_default_config(hardware_env: Dict[str, Any]) -> Dict[str, Any]:
     """根据硬件类型（nvidia/ascend）加载对应的默认引擎配置文件。
 
-    优先加载 vllm_default.json，不存在时回退到 <device>_default.json（兼容旧目录结构）。
+    加载策略：
+      1. 优先加载 vllm_default.json（新版统一配置）
+      2. 若 vllm_default.json 不存在 → 回退到 <device>_default.json（旧版布局）
+      3. 若 vllm_default.json 存在但缺少 model_deploy_config →
+         尝试从旧版 <device>_default.json 中补充 model_deploy_config（兼容旧配置）
+
+    兼容说明：
+      旧版使用 nvidia_default.json / ascend_default.json，其中包含按模型细分的
+      model_deploy_config 段落。新版统一使用 vllm_default.json，但如果部署环境
+      中同时存在旧版配置文件，会自动合并其中的 model_deploy_config 到新版配置中。
     """
     device_key = 'device'
     device_type = hardware_env.get(device_key, "nvidia")
@@ -675,7 +698,21 @@ def _load_default_config(hardware_env: Dict[str, Any]) -> Dict[str, Any]:
             logger.warning("Fallback to legacy default config: %s", legacy_path)
             default_config_path = legacy_path
     logger.info(f"Determined default config file for hardware environment '{device_type}': {default_config_path}")
-    return load_json_config(default_config_path)
+    config = load_json_config(default_config_path)
+
+    # 兼容旧版：若主配置缺少 model_deploy_config，尝试从旧版设备配置文件中补充
+    if "model_deploy_config" not in config and default_file == "vllm_default.json":
+        legacy_file = f"{device_type}_default.json"
+        legacy_path = os.path.join(DEFAULT_CONFIG_DIR, legacy_file)
+        if os.path.exists(legacy_path):
+            legacy_config = load_json_config(legacy_path)
+            if "model_deploy_config" in legacy_config:
+                config["model_deploy_config"] = legacy_config["model_deploy_config"]
+                logger.info(
+                    "Supplemented model_deploy_config from legacy config: %s",
+                    legacy_path,
+                )
+    return config
 
 
 def _load_engine_fallback_defaults(engine: str) -> Dict[str, Any]:
@@ -834,6 +871,10 @@ def _auto_select_engine(hardware_env: Dict[str, Any],
     # 在昇腾设备上将 vllm 自动升级为 vllm_ascend
     if engine == "vllm":
         _handle_ascend_vllm(device_type, cmd_known_params)
+
+    # 分布式参数注入（distributed_executor_backend, ray/nixl/dist_port 等）
+    if cmd_known_params.get("distributed"):
+        _handle_distributed(engine, cmd_known_params, model_info)
 
     # 确定最终设备数量：full 模式使用硬件探测值，其他模式使用用户指定值
     # device_count

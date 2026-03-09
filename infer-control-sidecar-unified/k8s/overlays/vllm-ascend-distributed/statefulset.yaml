@@ -1,6 +1,7 @@
 # StatefulSet: vLLM-Ascend + Ray 跨节点分布式推理
 # 硬件: Ascend 910B2C NPU
-# 架构: rank-0 = Ray Head + vLLM serve, rank-1 = Ray Worker
+# 架构: Master Pod 协调分发, Worker Pod 等待指令
+# 分布式参数 (nnodes/node_rank/head_node_addr) 由 Master 自动计算注入
 #
 # ⚠️ 部署前必须修改标记为 CUSTOMIZE 的参数
 # ---------------------------------------------------------------------------
@@ -82,14 +83,12 @@ spec:
               value: "1"
             - name: DISTRIBUTED
               value: "true"
-            - name: NNODES
-              value: "2"                                 # CUSTOMIZE: 节点数
-            - name: NODE_RANK
+            - name: MASTER_IP
+              value: "CHANGE_ME"                         # CUSTOMIZE: Master 节点 IP (NODE_IPS 中第一个)
+            - name: RANK_IP
               valueFrom:
                 fieldRef:
-                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
-            - name: HEAD_NODE_ADDR
-              value: "CHANGE_ME"                         # CUSTOMIZE: rank-0 节点 IP
+                  fieldPath: status.podIP
             - name: NODE_IPS
               value: "CHANGE_ME,CHANGE_ME"               # CUSTOMIZE: 所有节点 IP (逗号分隔)
             - name: ENGINE

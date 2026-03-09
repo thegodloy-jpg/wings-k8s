@@ -54,6 +54,8 @@ import os
 import re
 from typing import Dict, Any, List
 
+from app.utils.model_utils import ModelIdentifier
+
 from app.utils.env_utils import get_local_ip, get_lmcache_env, \
     get_pd_role_env, get_qat_env
 
@@ -488,9 +490,11 @@ def build_start_script(params: Dict[str, Any]) -> str:
     nnodes = params.get("nnodes", 1)
     backend = params.get("distributed_executor_backend", "ray")
     head_addr = params.get("head_node_addr", "infer-0.infer-hl")
-    # NODE_IPS: comma-separated list of all node IPs (e.g. "192.168.1.100,192.168.1.101")
-    node_ips = os.getenv("NODE_IPS", head_addr)
-    ray_port = os.getenv("RAY_PORT", "6379")
+    # NODE_IPS: params["nodes"] 优先（由 config_loader / Master 注入），其次环境变量
+    node_ips = params.get("nodes", os.getenv("NODE_IPS", head_addr))
+    # ray_head_port: params 优先（config_loader 从 distributed_config.json 注入 28020），
+    # 其次环境变量，最后回退到 28020（与 wings 对齐）
+    ray_port = str(params.get("ray_head_port", os.getenv("RAY_PORT", "28020")))
 
     if is_distributed and nnodes > 1:
         script_parts = []
@@ -634,12 +638,49 @@ def build_start_script(params: Dict[str, Any]) -> str:
                 ray_worker_resource = "--resources='{\"NPU\": 1}'" if is_ascend else "--num-gpus=1"
                 script_parts.append(f"exec ray start --address=$HEAD_IP:{ray_port} --node-ip-address=$VLLM_HOST_IP {ray_worker_resource} --block")
         else: # dp_deployment
-            if node_rank == 0:
-                dp_rpc_port = os.getenv('VLLM_DP_RPC_PORT', '13355')
-                script_parts.append(f"exec {cmd} --data-parallel-address {head_addr} --data-parallel-rpc-port {dp_rpc_port} --data-parallel-size {nnodes} --data-parallel-size-local 1 --data-parallel-external-lb --data-parallel-rank 0")
+            # rpc_port: params 优先（config_loader 从 distributed_config.json 注入），其次环境变量
+            dp_rpc_port = str(params.get("rpc_port", os.getenv('VLLM_DP_RPC_PORT', '13355')))
+
+            # DeepseekV3ForCausalLM 在 vllm_ascend DP 模式下使用专用并行参数
+            model_info = ModelIdentifier(
+                params.get("model_name"), params.get("model_path"), params.get("model_type"))
+            if (model_info.model_architecture == "DeepseekV3ForCausalLM"
+                    and engine == "vllm_ascend"):
+                dp_size = "4"
+                dp_size_local = "2"
+                dp_start_rank = "2" if node_rank != 0 else "0"
             else:
-                dp_rpc_port = os.getenv('VLLM_DP_RPC_PORT', '13355')
-                script_parts.append(f"exec {cmd} --data-parallel-address {head_addr} --data-parallel-rpc-port {dp_rpc_port} --data-parallel-size {nnodes} --data-parallel-size-local 1 --data-parallel-external-lb --headless --data-parallel-rank {node_rank}")
+                dp_size = str(nnodes)
+                dp_size_local = "1"
+                dp_start_rank = str(node_rank)
+
+            # dp_deployment 模式分布式通信环境变量（对齐 A）
+            net_if = os.getenv("NETWORK_INTERFACE", os.getenv("GLOO_SOCKET_IFNAME", "eth0"))
+            if is_ascend:
+                script_parts.extend([
+                    f"export HCCL_IF_IP=${{POD_IP:-$(python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));print(s.getsockname()[0]);s.close()\" 2>/dev/null || hostname -i)}}",
+                    f"export GLOO_SOCKET_IFNAME={net_if}",
+                    f"export TP_SOCKET_IFNAME={net_if}",
+                    f"export HCCL_SOCKET_IFNAME={net_if}",
+                    "export OMP_PROC_BIND=false",
+                    f"export OMP_NUM_THREADS={os.getenv('OMP_NUM_THREADS', '100')}",
+                    "export HCCL_BUFFSIZE=1024",
+                ])
+            else:
+                script_parts.extend([
+                    f"export GLOO_SOCKET_IFNAME={net_if}",
+                    f"export TP_SOCKET_IFNAME={net_if}",
+                    f"export NCCL_SOCKET_IFNAME={net_if}",
+                    f"export VLLM_NIXL_SIDE_CHANNEL_PORT={params.get('nixl_port', os.getenv('VLLM_NIXL_SIDE_CHANNEL_PORT', '12345'))}",
+                    "export NCCL_IB_DISABLE=0",
+                    "export NCCL_CUMEM_ENABLE=0",
+                    "export NCCL_NET_GDR_LEVEL=SYS",
+                ])
+
+            if node_rank == 0:
+                script_parts.append(f"exec {cmd} --data-parallel-address {head_addr} --data-parallel-rpc-port {dp_rpc_port} --data-parallel-size {dp_size} --data-parallel-size-local {dp_size_local} --data-parallel-external-lb --data-parallel-rank 0")
+            else:
+                script_parts.append(f"exec {cmd} --data-parallel-address {head_addr} --data-parallel-rpc-port {dp_rpc_port} --data-parallel-size {dp_size} --data-parallel-size-local {dp_size_local} --data-parallel-external-lb --headless --data-parallel-start-rank {dp_start_rank}")
         return "\n".join(script_parts) + "\n"
 
     if engine == "vllm_ascend":

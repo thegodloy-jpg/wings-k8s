@@ -86,6 +86,14 @@ class Settings(BaseSettings):
     TP_SIZE: int = int(os.getenv("TP_SIZE", "1"))
     MAX_MODEL_LEN: int = int(os.getenv("MAX_MODEL_LEN", "4096"))
 
+    # ---- 分布式模式配置 ----
+    # 这些字段由 _determine_role() 使用，控制 Master/Worker 模式分支。
+    # K8s 仅需注入 DISTRIBUTED=true、MASTER_IP 和 NODE_IPS（逗号分隔），
+    # 其余分布式参数（nnodes/node_rank/head_node_addr）由 Master 动态计算注入。
+    DISTRIBUTED: bool = _env_bool("DISTRIBUTED", False)
+    MASTER_IP: str = os.getenv("MASTER_IP", "")
+    NODE_IPS: str = os.getenv("NODE_IPS", "")  # 逗号分隔的所有节点 IP
+
     # ---- 历史兼容字段 ----
     # 这些字段在 v4 架构中已不再是核心配置，但仍被部分旧版部署模板
     # 和 legacy wings_start.sh 脚本引用，因此保留以保证向后兼容。
@@ -94,7 +102,7 @@ class Settings(BaseSettings):
     SERVICE_CLUSTER_IP: str = os.getenv("SERVICE_CLUSTER_IP", "")  # K8s Service ClusterIP（可选）
     NODE_PORT: str = os.getenv("NODE_PORT", "30483")  # K8s NodePort 端口号
     NODE_IP: str = os.getenv("NODE_IP", "")  # 当前宿主机 IP
-    ENABLE_ACCEL: bool = _env_bool("ENABLE_ACCEL", False)  # 是否启用硬件加速（旧字段）
+    ENABLE_ACCEL: bool = _env_bool("ENABLE_ACCEL", False)  # 是否启用 Accel 加速包（注入 WINGS_ENGINE_PATCH_OPTIONS）
 
     class Config:
         """pydantic-settings 配置类：启用 .env 文件自动加载。"""

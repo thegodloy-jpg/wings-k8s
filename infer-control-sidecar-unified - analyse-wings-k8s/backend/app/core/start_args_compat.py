@@ -216,7 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # 支持的推理引擎白名单；不在此集合中的 engine 值将被 parse_launch_args 拒绝
-SUPPORTED_ENGINES = {"vllm", "vllm_ascend", "sglang", "mindie"}
+SUPPORTED_ENGINES = {"vllm", "vllm_ascend", "sglang", "mindie", "wings"}
 
 
 def parse_launch_args(argv: list[str] | None = None) -> LaunchArgs:
