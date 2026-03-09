@@ -259,7 +259,10 @@ export MODEL_PATH
 export SAVE_PATH
 [ -n "${ENGINE:-}" ]                  && export ENGINE
 [ -n "${HOST:-}" ]                    && export HOST
-[ -n "${BACKEND_PORT:-}" ]            && export PORT="$BACKEND_PORT"
+# 代理关闭时才将 PORT 覆写为后端端口；代理开启时 PORT 保持用户指定值（proxy port，默认 18000）
+if [[ "${ENABLE_REASON_PROXY,,}" == "false" ]]; then
+    [ -n "${BACKEND_PORT:-}" ] && export PORT="$BACKEND_PORT"
+fi
 [ -n "${DTYPE:-}" ]                   && export DTYPE
 [ -n "${KV_CACHE_DTYPE:-}" ]          && export KV_CACHE_DTYPE
 [ -n "${QUANTIZATION:-}" ]            && export QUANTIZATION
@@ -316,7 +319,7 @@ APP_ARGS="--model-name $MODEL_NAME --model-path $MODEL_PATH"
 [ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]  && APP_ARGS+=" --max-num-batched-tokens $MAX_NUM_BATCHED_TOKENS"
 [ "${ENABLE_PREFIX_CACHING:-}" = true ] && APP_ARGS+=" --enable-prefix-caching"
 [ -n "${HOST:-}" ]                    && APP_ARGS+=" --host $HOST"
-[ -n "${BACKEND_PORT:-}" ]            && APP_ARGS+=" --port $BACKEND_PORT"
+[ -n "${PROXY_PORT:-}" ]              && APP_ARGS+=" --port $PROXY_PORT"
 [ -n "${INPUT_LENGTH:-}" ]            && APP_ARGS+=" --input-length $INPUT_LENGTH"
 [ -n "${OUTPUT_LENGTH:-}" ]           && APP_ARGS+=" --output-length $OUTPUT_LENGTH"
 [ -n "${CONFIG_FILE:-}" ]             && APP_ARGS+=" --config-file $CONFIG_FILE"

@@ -41,6 +41,10 @@ spec:
           hostPath:
             path: /usr/local/Ascend/driver/lib64/driver
             type: DirectoryOrCreate
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
 
       containers:
         - name: wings-infer
@@ -129,6 +133,8 @@ spec:
             - name: ascend-driver
               mountPath: /usr/local/Ascend/driver/lib64/driver
               readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
           resources:
             requests:
               cpu: "4"

@@ -201,7 +201,7 @@ class QueueGate:
 
 
     @staticmethod
-    def _queue_disabled_raise(self, rid: str | None) -> None:
+    def _queue_disabled_raise(rid: str | None) -> None:
         _elog("qgate_queue_disabled", rid=rid)
         raise HTTPException(
             status_code=503, detail="server busy: queue disabled",

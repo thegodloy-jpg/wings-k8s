@@ -1,0 +1,32 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-hl
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: infer-mindie
+  ports:
+    - name: hccl
+      port: 27070
+    - name: proxy
+      port: 18000
+    - name: health
+      port: 19000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-api
+spec:
+  selector:
+    app.kubernetes.io/name: infer-mindie
+    statefulset.kubernetes.io/pod-name: infer-0
+  ports:
+    - name: proxy
+      port: 18000
+      targetPort: 18000
+    - name: health
+      port: 19000
+      targetPort: 19000

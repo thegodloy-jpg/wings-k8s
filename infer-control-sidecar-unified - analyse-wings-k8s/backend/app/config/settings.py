@@ -1,0 +1,106 @@
+"""全局配置定义。
+
+这个模块的配置会被 launcher、proxy、health 共同使用，因此这里的默认值
+实际上就是 sidecar 架构的运行契约。修改端口、应用入口或共享卷路径时，
+通常需要同时检查 Kubernetes 清单和 engine 容器启动逻辑是否仍然一致。
+
+配置优先级（从高到低）：
+  1. 系统环境变量 → 由 K8s ConfigMap/Secret 或 docker run -e 注入
+  2. .env 文件   → 本地开发时使用（pydantic-settings 自动加载）
+  3. 代码默认值   → 本模块中的 default= 参数
+
+核心设计要点：
+  - 所有端口、路径都通过环境变量驱动，便于 K8s 动态配置
+  - Settings 类在模块级别实例化为单例 `settings`，进程内全局唯一
+  - 布尔环境变量统一用 _env_bool() 解析，支持 1/true/yes/on 等格式
+"""
+
+import os
+
+from pydantic_settings import BaseSettings
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """统一解析布尔环境变量。
+
+    支持的真值字符串: '1', 'true', 'yes', 'on'（大小写不敏感）。
+    当环境变量不存在时返回 default 默认值。
+
+    Args:
+        name: 环境变量名称
+        default: 环境变量不存在时的默认返回值
+
+    Returns:
+        bool: 解析后的布尔值
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+class Settings(BaseSettings):
+    """全局配置类，集中管理 sidecar 运行时的所有可配置参数。
+
+    配置项涵盖：
+      - 共享卷路径与启动脚本文件名
+      - 引擎类型、主机和端口
+      - sidecar 三层端口规划（backend / proxy / health）
+      - 子服务启动入口（uvicorn 模块路径）
+      - 模型路径、TP 大小等引擎参数
+      - 历史兼容字段（健康检查、NodePort 等）
+
+    所有参数均通过环境变量驱动，支持 K8s ConfigMap/Secret 注入，
+    同时通过 pydantic-settings 自动加载 .env 文件用于本地开发。
+    本类在模块级别实例化为单例 ``settings``，进程内全局唯一。
+    """
+    # 共享卷路径：launcher 在这里写 start_command.sh，engine 容器在这里读取。
+    SHARED_VOLUME_PATH: str = os.getenv("SHARED_VOLUME_PATH", "/shared-volume")
+    START_COMMAND_FILENAME: str = os.getenv("START_COMMAND_FILENAME", "start_command.sh")
+
+    # 引擎基础配置。ENGINE_PORT 是 backend 真实监听端口，不是对外代理端口。
+    ENGINE_TYPE: str = os.getenv("ENGINE_TYPE", "vllm")
+    ENGINE_HOST: str = os.getenv("ENGINE_HOST", "127.0.0.1")
+    ENGINE_PORT: int = int(os.getenv("ENGINE_PORT", "17000"))
+    ENABLE_REASON_PROXY: bool = _env_bool("ENABLE_REASON_PROXY", True)
+
+    # sidecar 三层端口：
+    # - backend: engine 真正服务端口
+    # - proxy:   对外 API 端口
+    # - health:  专用健康检查端口
+    PORT: int = int(os.getenv("PORT", "18000"))
+    HEALTH_PORT: int = int(os.getenv("HEALTH_PORT", "19000"))
+    WINGS_PORT: int = int(os.getenv("WINGS_PORT", "9000"))  # legacy field
+
+    # 子服务启动入口。launcher 会调用 `python -m uvicorn <app>` 启动对应服务。
+    PYTHON_BIN: str = os.getenv("PYTHON_BIN", "python")
+    UVICORN_MODULE: str = os.getenv("UVICORN_MODULE", "uvicorn")
+    PROXY_APP: str = os.getenv("PROXY_APP", "app.proxy.gateway:app")
+    HEALTH_APP: str = os.getenv("HEALTH_APP", "app.proxy.health_service:app")
+    PROCESS_POLL_SEC: float = float(os.getenv("PROCESS_POLL_SEC", "1.0"))
+
+    # 与历史 wings_start 语义兼容的模型默认参数。
+    MODEL_NAME: str = os.getenv("MODEL_NAME", "")
+    MODEL_PATH: str = os.getenv("MODEL_PATH", "/weights")
+    SAVE_PATH: str = os.getenv("SAVE_PATH", "/opt/wings/outputs")
+    TP_SIZE: int = int(os.getenv("TP_SIZE", "1"))
+    MAX_MODEL_LEN: int = int(os.getenv("MAX_MODEL_LEN", "4096"))
+
+    # ---- 历史兼容字段 ----
+    # 这些字段在 v4 架构中已不再是核心配置，但仍被部分旧版部署模板
+    # 和 legacy wings_start.sh 脚本引用，因此保留以保证向后兼容。
+    HEALTH_CHECK_INTERVAL: int = int(os.getenv("HEALTH_CHECK_INTERVAL", "5"))  # 健康检查间隔（秒）
+    HEALTH_CHECK_TIMEOUT: int = int(os.getenv("HEALTH_CHECK_TIMEOUT", "300"))  # 健康检查超时（秒）
+    SERVICE_CLUSTER_IP: str = os.getenv("SERVICE_CLUSTER_IP", "")  # K8s Service ClusterIP（可选）
+    NODE_PORT: str = os.getenv("NODE_PORT", "30483")  # K8s NodePort 端口号
+    NODE_IP: str = os.getenv("NODE_IP", "")  # 当前宿主机 IP
+    ENABLE_ACCEL: bool = _env_bool("ENABLE_ACCEL", False)  # 是否启用 Accel 加速包（注入 WINGS_ENGINE_PATCH_OPTIONS）
+
+    class Config:
+        """pydantic-settings 配置类：启用 .env 文件自动加载。"""
+        env_file = ".env"
+
+
+# 模块级别的全局配置单例。
+# 整个 sidecar 进程内所有子系统均通过 `from app.config.settings import settings` 引用此实例。
+settings = Settings()

@@ -569,7 +569,9 @@ def build_start_script(params: Dict[str, Any]) -> str:
                 if is_ascend:
                     script_parts.append("export VLLM_HOST_IP=${POD_IP:-$(python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));print(s.getsockname()[0]);s.close()\" 2>/dev/null || hostname -i)}")
                 else:
-                    script_parts.append("export VLLM_HOST_IP=$(hostname -i)")
+                    # For NV with hostNetwork, POD_IP = node's external IP (routable between nodes).
+                    # 'hostname -i' returns the container bridge IP (172.17.x.x), NOT suitable for Ray.
+                    script_parts.append("export VLLM_HOST_IP=${POD_IP:-$(python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));print(s.getsockname()[0]);s.close()\" 2>/dev/null || hostname -i)}")
                 if is_ascend:
                     # Ascend: use HCCL instead of NCCL
                     script_parts.append("export HCCL_WHITELIST_DISABLE=1")
@@ -620,6 +622,8 @@ def build_start_script(params: Dict[str, Any]) -> str:
                     script_parts.append("export VLLM_HOST_IP=${POD_IP:-$(python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));print(s.getsockname()[0]);s.close()\" 2>/dev/null || hostname -i)}")
                 else:
                     script_parts.append(f"export NCCL_SOCKET_IFNAME={os.getenv('NCCL_SOCKET_IFNAME', 'eth0')}")
+                    # Worker's own routable IP (for Ray node-ip-address)
+                    script_parts.append("export VLLM_HOST_IP=${POD_IP:-$(python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));print(s.getsockname()[0]);s.close()\" 2>/dev/null || hostname -i)}")
                     script_parts.append("for i in $(seq 1 60); do")
                     script_parts.append(f"  python3 -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('{head_addr}',{ray_port})); s.close()\" 2>/dev/null && break")
                     script_parts.append("  sleep 5")

@@ -133,6 +133,11 @@ def _check_vram_requirements(weight_path: str, hardware_env: Dict[str, Any], nod
         logger.warning("Cannot get VRAM details, skipping VRAM check")
         return
 
+    # 如果 details 中缺少 free_memory 字段（只有 name），跳过 VRAM 检查
+    if not all("free_memory" in d for d in hardware_env["details"]):
+        logger.warning("VRAM details lack free_memory field, skipping VRAM check")
+        return
+
     # VRAM
     free_vram_per_node = sum(d["free_memory"] for d in hardware_env["details"])
     total_free_vram = free_vram_per_node * nodes_count
@@ -272,7 +277,10 @@ def _set_cuda_graph_sizes(params, ctx, model_info):
     """
     if ctx["gpu_usage_mode"] != "full" and ctx["model_type"] == "llm":
         if ctx["device_details"] and ctx["device_details"][0]:
-            total_memory = ctx["device_details"][0]["total_memory"]
+            total_memory = ctx["device_details"][0].get("total_memory", 12)
+            if total_memory is None:
+                total_memory = 12
+                logger.warning("total_memory is None in device details, defaulting to 12G")
         else:
             total_memory = 12
             logger.warning("Can't get device details, will set total_memroy to 12G")
@@ -993,7 +1001,7 @@ def _validate_user_engine(engine: str, device_name: str, gpu_usage_mode: str, mo
         # embeddingrerankvllm_ascend
         elif model_type in ["embedding", "rerank"]:
             logger.warning(f"model type is {model_type}, automatically switched to VLLM_Ascend engine")
-            return vllm
+            return "vllm_ascend"
         elif get_router_env():
             logger.warning("Wings router enabled, automatically switched to VLLM engine")
             return vllm
@@ -1001,7 +1009,7 @@ def _validate_user_engine(engine: str, device_name: str, gpu_usage_mode: str, mo
         elif get_operator_acceleration_env():
             logger.warning(f"operator_acceleration is enabled, \
                             automatically switched to VLLM_Ascend engine")
-            return vllm
+            return "vllm_ascend"
     elif engine == 'sglang':
         if get_lmcache_env():
             logger.warning("[KVCache Offload] KVCache Offload enabled, automatically switched to VLLM engine")
@@ -1513,8 +1521,8 @@ def load_and_merge_configs(
     # VRAM
     cmd_known_params = _process_cmd_args(known_args)
     if cmd_known_params.get("model_path"):
-        if cmd_known_params.get("nodes"):
-            nodes_count = len(cmd_known_params.get("nodes").split(','))
+        if cmd_known_params.get("nnodes"):
+            nodes_count = cmd_known_params.get("nnodes")
         else:
             nodes_count = 1
         _check_vram_requirements(cmd_known_params["model_path"], hardware_env, nodes_count)

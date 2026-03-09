@@ -1,0 +1,44 @@
+# Headless Service + ClusterIP Service for vLLM-Ascend distributed
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-hl
+  labels:
+    app.kubernetes.io/name: infer-vllm-ascend
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: infer-vllm-ascend
+  ports:
+    - name: ray-gcs
+      port: 6379
+      targetPort: 6379
+    - name: engine
+      port: 17000
+      targetPort: 17000
+    - name: proxy
+      port: 18000
+      targetPort: 18000
+    - name: health
+      port: 19000
+      targetPort: 19000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-api
+  labels:
+    app.kubernetes.io/name: infer-vllm-ascend
+spec:
+  selector:
+    app.kubernetes.io/name: infer-vllm-ascend
+    statefulset.kubernetes.io/pod-name: infer-0
+  ports:
+    - name: proxy
+      port: 18000
+      targetPort: 18000
+    - name: health
+      port: 19000
+      targetPort: 19000

@@ -54,6 +54,18 @@ spec:
           hostPath:
             path: /usr/local/Ascend/driver/lib64
             type: Directory
+        - name: hccn-conf
+          hostPath:
+            path: /etc/hccn.conf
+            type: File
+        - name: npu-smi
+          hostPath:
+            path: /usr/local/sbin/npu-smi
+            type: File
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
 
       containers:
         - name: wings-infer
@@ -93,6 +105,9 @@ spec:
               value: "19000"
             - name: WINGS_SKIP_PID_CHECK
               value: "true"
+            # ---- HCCL RoCE 设备 IP（用于分布式 rank table 的 device_ip 字段）----
+            - name: HCCL_DEVICE_IPS
+              value: "CHANGE_ME;CHANGE_ME"               # CUSTOMIZE: 各节点 RoCE 设备 IP，分号分隔
           volumeMounts:
             - name: shared-volume
               mountPath: /shared-volume
@@ -107,6 +122,11 @@ spec:
             initialDelaySeconds: 60
             periodSeconds: 10
             failureThreshold: 54
+          livenessProbe:
+            httpGet: { path: /health, port: 19000 }
+            initialDelaySeconds: 180
+            periodSeconds: 30
+            failureThreshold: 5
 
         - name: engine
           image: mindie:2.2.RC1                          # CUSTOMIZE
@@ -122,6 +142,8 @@ spec:
           env:
             - name: ASCEND_VISIBLE_DEVICES
               value: "0"
+            - name: PATH
+              value: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           volumeMounts:
             - name: shared-volume
               mountPath: /shared-volume
@@ -140,6 +162,14 @@ spec:
             - name: ascend-driver-lib
               mountPath: /usr/local/Ascend/driver/lib64
               readOnly: true
+            - name: hccn-conf
+              mountPath: /etc/hccn.conf
+              readOnly: true
+            - name: npu-smi
+              mountPath: /usr/local/sbin/npu-smi
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
           resources:
             requests: { cpu: "4", memory: "16Gi" }
             limits: { cpu: "24", memory: "64Gi" }

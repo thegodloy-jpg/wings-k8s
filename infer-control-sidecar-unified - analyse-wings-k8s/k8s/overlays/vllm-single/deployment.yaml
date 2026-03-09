@@ -1,0 +1,140 @@
+# =============================================================================
+# Deployment: vLLM 单机推理 (NVIDIA GPU)
+# 架构:
+#   - wings-infer 容器: Sidecar 核心，生成启动脚本、运行 Proxy/Health
+#   - engine 容器:      vLLM 推理服务，等待并执行 start_command.sh
+# 共享卷:
+#   - /shared-volume: wings-infer 写入启动脚本，engine 容器执行
+#   - /models:        模型文件挂载（hostPath）
+# Accel 加速:
+#   - 通过 initContainer 从 wings-accel 镜像拷贝加速文件到 accel-volume
+#   - engine 容器根据 ENABLE_ACCEL 环境变量决定是否安装加速包
+#   - 加速包包含 wings_engine_patch (Python whl)，安装到引擎运行环境
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infer-vllm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infer-vllm
+    spec:
+      volumes:
+        - name: shared-volume
+          emptyDir: {}
+        - name: model-volume
+          hostPath:
+            path: /mnt/models                           # CUSTOMIZE
+            type: DirectoryOrCreate
+        - name: accel-volume
+          emptyDir: {}                                   # accel 初始化容器产物
+
+      # ---- 初始化容器：拷贝 accel 加速文件 ----
+      initContainers:
+        - name: accel-init
+          image: wings-accel:latest                      # CUSTOMIZE
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "Copying accel files to shared volume..."
+              cp -r /accel/* /accel-volume/
+              echo "Accel files copied successfully"
+          volumeMounts:
+            - name: accel-volume
+              mountPath: /accel-volume
+
+      containers:
+        - name: wings-infer
+          image: wings-infer:latest                      # CUSTOMIZE
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 18000
+            - containerPort: 19000
+          env:
+            - name: ENGINE
+              value: "vllm"
+            - name: MODEL_NAME
+              value: "DeepSeek-R1-Distill-Qwen-1.5B"     # CUSTOMIZE
+            - name: MODEL_PATH
+              value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+            - name: ENGINE_PORT
+              value: "17000"
+            - name: PORT
+              value: "18000"
+            - name: HEALTH_PORT
+              value: "19000"
+            - name: WINGS_SKIP_PID_CHECK
+              value: "true"
+            - name: BACKEND_URL
+              value: "http://127.0.0.1:17000"
+            - name: ENABLE_ACCEL
+              value: "true"                              # CUSTOMIZE: 设为 "false" 禁用加速
+          volumeMounts:
+            - name: shared-volume
+              mountPath: /shared-volume
+            - name: model-volume
+              mountPath: /models
+              readOnly: true
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "2", memory: "4Gi" }
+          readinessProbe:
+            httpGet: { path: /health, port: 19000 }
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 36
+          livenessProbe:
+            httpGet: { path: /health, port: 19000 }
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 5
+
+        - name: engine
+          image: vllm/vllm-openai:latest                 # CUSTOMIZE
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "[engine] Waiting for start_command.sh..."
+              while [ ! -f /shared-volume/start_command.sh ]; do sleep 2; done
+
+              # 根据 ENABLE_ACCEL 决定是否安装加速包
+              if [ "$ENABLE_ACCEL" = "true" ]; then
+                echo "[engine] Accel is enabled, installing accel packages..."
+                if [ -f /accel-volume/install.sh ]; then
+                  cd /accel-volume && bash install.sh
+                  if [ $? -eq 0 ]; then
+                    echo "[engine] Accel packages installed successfully"
+                  else
+                    echo "[engine] WARNING: Accel install.sh failed (exit code: $?), continuing without accel"
+                  fi
+                else
+                  echo "[engine] WARNING: /accel-volume/install.sh not found, skipping accel installation"
+                fi
+              else
+                echo "[engine] Accel is disabled, skipping installation"
+              fi
+
+              echo "[engine] Executing start_command.sh..."
+              cd /shared-volume && bash start_command.sh
+          env:
+            - name: ENABLE_ACCEL
+              value: "true"                              # CUSTOMIZE: 与 wings-infer 保持一致
+          volumeMounts:
+            - name: shared-volume
+              mountPath: /shared-volume
+            - name: model-volume
+              mountPath: /models
+              readOnly: true
+            - name: accel-volume
+              mountPath: /accel-volume
+          resources:
+            requests: { cpu: "4", memory: "16Gi" }
+            limits: { cpu: "16", memory: "48Gi" }

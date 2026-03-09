@@ -1,0 +1,1100 @@
+﻿# =============================================================================
+# 文件: proxy/gateway.py
+# 用途: 主业务代理应用，转发 OpenAI 兼容请求到后端推理引擎
+# 状态: 活跃，复用自 wings 项目
+#
+# 功能概述:
+#   本模块是 sidecar 代理层的核心入口，承担以下职责：
+#   1. 对外暴露 OpenAI 兼容接口 (/v1/chat/completions 等)
+#   2. 将请求转发到 backend engine (vLLM/SGLang/MindIE)
+#   3. 对流式/非流式响应采用不同的回传策略，兼顾首包延迟 (TTFT) 和吞吐
+#   4. 维护观测头 (X-InFlight 等)、重试信息、并发控制
+#   5. 提供 /health、/metrics、/v1/models 等辅助接口
+#
+# 核心组件:
+#   - QueueGate    : 双闸门 FIFO 排队控制器（来自 queueing.py）
+#   - httpx.AsyncClient : 异步 HTTP 客户端池
+#   - health 状态机 : 后台持续探测后端健康
+#
+# 请求流程:
+#   Client -> Gateway (/v1/chat/completions)
+#       -> gate.acquire()
+#       -> _send_with_fixed_retries() -> backend
+#       -> _stream_gen() / _pipe_nonstream()
+#       -> StreamingResponse / JSONResponse
+#       -> gate.release()
+#
+# Sidecar 架构契约:
+#   - 保持转发语义和重试行为稳定
+#   - 避免不兼容的重写，仅做最小化适配
+#   - 通过 uvicorn "app.proxy.gateway:app" 启动
+#
+# =============================================================================
+# -*- coding: utf-8 -*-
+"""主业务代理入口。
+
+职责可以概括为三类：
+1. 对外暴露 OpenAI 兼容接口，并把请求转发到 backend engine；
+2. 对流式和非流式响应采用不同的回传策略，兼顾首包延迟和吞吐；
+3. 维护观测头、重试信息以及 `/health`、`/metrics` 等辅助接口。
+"""
+
+from __future__ import annotations
+import asyncio
+import inspect
+import random
+import time
+from typing import Any, AsyncIterator, Dict
+
+import os
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from . import settings as C
+from .http_client import create_async_client
+from .queueing import QueueGate
+from .tags import (
+    want_stream,
+    want_topk,
+    rebuild_request_json,
+    make_upstream_headers,
+    read_json_body,
+    jlog, elog, ms,
+    build_backend_url,
+)
+from .speaker_logging import configure_worker_logging
+
+# 健康状态机在 `health.py` 中维护，gateway 只负责对外暴露结果。
+from .health import (
+    setup_health_monitor,
+    teardown_health_monitor,
+    map_http_code_from_state,
+    build_health_body,
+    build_health_headers,
+)
+
+configure_worker_logging()
+
+# =============================================================================
+# 全局配置常量
+# =============================================================================
+
+# 单请求体大小上限，超出会在读取阶段被拒绝，避免代理进程被大包压垮。
+MAX_REQUEST_BYTES = int(os.getenv("MAX_REQUEST_BYTES", str(2 * 1024 * 1024)))
+
+# 由 launcher 通过 uvicorn 启动的 FastAPI 应用。
+app = FastAPI()
+
+# backend 地址由 launcher 注入环境变量，这里只做读取。
+app.state.backend = C.BACKEND_URL
+
+# 做 httpx 版本兼容：有的版本 `send()` 支持 timeout，有的版本不支持。
+_SEND_HAS_TIMEOUT = "timeout" in inspect.signature(httpx.AsyncClient.send).parameters
+
+
+# =============================================================================
+# 内部函数：HTTP 请求发送与重试逻辑
+# =============================================================================
+
+
+async def _raw_send(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    content: bytes | None = None,
+    headers: dict | None = None,
+    stream: bool = False,
+    timeout: httpx.Timeout | None = None,
+) -> httpx.Response:
+    """统一封装底层发送逻辑，屏蔽不同 httpx 版本的签名差异。
+
+    Args:
+        client: httpx 异步客户端实例
+        method: HTTP 方法 ("GET"/"POST"/...)
+        url:    请求目标 URL
+        content: 请求体字节数据
+        headers: 请求头字典
+        stream:  是否使用流式接收响应
+        timeout: 可选超时配置
+
+    Returns:
+        httpx.Response: 后端响应对象
+
+    实现说明:
+        httpx 不同版本的 send() 方法签名不同，有些支持 timeout 参数，
+        有些不支持。通过 _SEND_HAS_TIMEOUT 标志动态决定是否传递 timeout。
+    """
+    req = client.build_request(method, url, content=content, headers=headers)
+    if _SEND_HAS_TIMEOUT and timeout is not None:
+        return await client.send(req, stream=stream, timeout=timeout)
+    return await client.send(req, stream=stream)
+
+# =============================================================================
+# 重试策略配置
+# =============================================================================
+
+# 固定可重试异常和状态码集合，避免重试范围无限扩大。
+_RETRIABLE_EXC = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+_RETRIABLE_5XX = (502, 503, 504)
+
+# =============================================================================
+# 重试辅助函数
+# =============================================================================
+
+
+def _should_retry_status(stream: bool, status_code: int, attempt: int, total: int) -> bool:
+    """判断是否应该基于 HTTP 状态码进行重试。
+
+    Args:
+        stream:      是否为流式请求
+        status_code: 后端返回的 HTTP 状态码
+        attempt:     当前尝试次数
+        total:       最大尝试次数
+
+    Returns:
+        bool: True 表示应该重试，False 表示不重试
+
+    设计决策:
+        - 仅对流式请求的部分 5xx (502/503/504) 做重试
+        - 普通请求保持行为更可预期，不重试
+    """
+    # 仅对流式请求的部分 5xx 做重试，普通请求保持行为更可预期。
+    return stream and status_code in _RETRIABLE_5XX and attempt < total
+
+
+async def _close_resp_quiet(resp: httpx.Response) -> None:
+    """安静关闭响应对象，忽略关闭过程中的异常。
+
+    用于重试逻辑中当需要关闭旧响应时调用，
+    防止关闭异常影响重试流程。
+
+    Args:
+        resp: 要关闭的 httpx.Response 对象
+    """
+    try:
+        await resp.aclose()
+    except Exception as e:
+        C.logger.error(f"Failed to close response: {e}")
+
+
+def _mark_retry_count(resp: httpx.Response, attempt: int) -> None:
+    """将实际重试次数记录到响应的 extensions 字典中。
+
+    后续可通过 X-Retry-Count 头透传给客户端，便于调试和观测。
+
+    Args:
+        resp:    后端响应对象
+        attempt: 当前尝试序号 (1-based)，重试次数 = attempt - 1
+    """
+    # 将“真实重试了几次”挂在 response 上，后续可透传给客户端观察。
+    try:
+        resp.extensions["app_retry_count"] = attempt - 1
+    except Exception as e:
+        C.logger.error(f"Failed to set retry count in response extensions: {e}")
+
+
+async def _log_and_wait_status_retry(rid: str | None, attempt: int, status: int, interval: float, t0: float) -> None:
+    """记录状态码重试日志并等待指定间隔后再重试。
+
+    在基于 HTTP 状态码触发重试时调用，先记录一条结构化日志，
+    然后异步休眠 interval 秒，为下一次重试预留后端恢复窗口。
+
+    Args:
+        rid:      请求 ID，用于日志关联
+        attempt:  当前尝试序号 (1-based)
+        status:   后端返回的 HTTP 状态码
+        interval: 两次重试之间的等待时间（秒）
+        t0:       本次尝试的起始时间戳（perf_counter）
+    """
+    elog(
+        "retry_status",
+        rid=rid, attempt=attempt, status=status,
+        next_wait_ms=int(interval * 1000), elapsed=ms(time.perf_counter() - t0),
+    )
+    await asyncio.sleep(interval)
+
+
+def _is_retriable_exception(e: Exception) -> bool:
+    """判断异常是否属于可重试类型。
+
+    仅将连接错误 (ConnectError)、连接超时 (ConnectTimeout)
+    和连接池耗尽 (PoolTimeout) 视为可重试异常，其余异常直接上抛。
+
+    Args:
+        e: 捕获到的异常实例
+
+    Returns:
+        bool: True 表示该异常可以安全重试
+    """
+    return isinstance(e, _RETRIABLE_EXC)
+
+
+async def _log_and_maybe_wait_exception(e: Exception, **ctx) -> bool:
+    """记录异常日志，若可重试则等待后返回 True。
+
+    对捕获到的异常执行以下流程：
+    1. 记录结构化日志（含异常类型、详情、是否可重试）；
+    2. 若该异常属于可重试类型且尚未用尽重试次数，则休眠 interval 秒并返回 True；
+    3. 否则返回 False，由调用方决定是否上抛。
+
+    Args:
+        e: 捕获到的异常实例
+        **ctx: 上下文关键字参数，包含：
+            - rid (str | None):    请求 ID
+            - attempt (int):       当前尝试序号
+            - total (int):         最大尝试次数
+            - interval (float):    重试等待间隔（秒）
+            - t0 (float):         本次尝试起始时间戳
+
+    Returns:
+        bool: True 表示已等待完毕、可以重试；False 表示不可重试
+    """
+    rid = ctx.get("rid")
+    attempt = ctx.get("attempt")
+    total = ctx.get("total")
+    interval = ctx.get("interval")
+    t0 = ctx.get("t0")
+
+    retriable = _is_retriable_exception(e)
+    elog(
+        "retry_exception",
+        rid=rid,
+        attempt=attempt,
+        err_type=e.__class__.__name__,
+        detail=str(e),
+        retriable=retriable,
+        next_wait_ms=(int(interval * 1000) if retriable and attempt < total else 0),
+        elapsed=ms(time.perf_counter() - t0),
+    )
+    if retriable and attempt < total:
+        await asyncio.sleep(interval)
+        return True
+    return False
+
+
+async def _send_with_fixed_retries(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    content: bytes | None = None,
+    headers: dict | None = None,
+    stream: bool = False,
+    timeout: httpx.Timeout | None = None,
+    rid: str | None = None,
+) -> httpx.Response:
+    """执行带固定重试策略的请求发送。
+
+    重试策略:
+        - 最多重试 RETRY_TRIES 次（包含首次调用）
+        - 每次重试间隔 RETRY_INTERVAL_MS 毫秒
+        - 仅重试连接错误、超时、连接池用尽
+        - 流式请求额外重试 502/503/504
+
+    Args:
+        client:  httpx 异步客户端
+        method:  HTTP 方法
+        url:     目标 URL
+        content: 请求体字节
+        headers: 请求头
+        stream:  是否流式接收
+        timeout: 超时配置
+        rid:     请求 ID（用于日志）
+
+    Returns:
+        httpx.Response: 成功的后端响应
+
+    Raises:
+        HTTPException(502): 后端连接错误或持续 5xx
+    """
+    total = max(1, int(C.RETRY_TRIES))
+    interval = max(0, int(C.RETRY_INTERVAL_MS)) / 1000.0
+    last_exc: Exception | None = None
+    last_status: int | None = None
+
+    for attempt in range(1, total + 1):
+        t0 = time.perf_counter()
+        try:
+            resp = await _raw_send(
+                client, method, url,
+                content=content, headers=headers, stream=stream, timeout=timeout
+            )
+
+            #  &  5xx
+            if _should_retry_status(stream, resp.status_code, attempt, total):
+                last_status = resp.status_code
+                await _close_resp_quiet(resp)
+                await _log_and_wait_status_retry(rid, attempt, last_status, interval, t0)
+                continue
+
+            #  extensions  -> 0
+            _mark_retry_count(resp, attempt)
+            return resp
+
+        except Exception as e:
+            last_exc = e
+            #
+            if await _log_and_maybe_wait_exception(e, rid=rid, attempt=attempt, total=total, interval=interval, t0=t0):
+                continue
+
+            #  httpx.RequestError  502
+            if isinstance(e, httpx.RequestError):
+                raise HTTPException(502, f"backend connect error: {e}") from e
+            raise
+
+    #
+    if last_exc is not None:
+        if isinstance(last_exc, httpx.RequestError):
+            elog("retry_final_fail", rid=rid, tries=total, final_error=str(last_exc))
+            raise HTTPException(502, f"backend connect error: {last_exc}") from last_exc
+        elog("retry_final_fail", rid=rid, tries=total, final_error=str(last_exc))
+        raise last_exc
+    if last_status is not None:
+        elog("retry_final_fail", rid=rid, tries=total, final_status=last_status)
+        raise HTTPException(502, f"backend 5xx after retries: {last_status}")
+    elog("retry_final_fail", rid=rid, tries=total, reason="unknown")
+    raise HTTPException(502, "backend error after retries")
+
+
+#   http
+
+
+@app.on_event("startup")
+async def _startup():
+    """初始化 HTTP 客户端、gate 和健康监控任务。"""
+    # 在 proxy 子进程中安装噪声过滤器（抑制 /health 访问日志等噪声）
+    from ..utils.noise_filter import install_noise_filters
+    install_noise_filters()
+
+    configure_worker_logging(force=True)
+    C.log_boot_plan()
+    app.state.client = await create_async_client()
+    app.state.gate = QueueGate()
+
+    # 启动后台健康轮询，让 `/health` 能读到持续更新的状态。
+    setup_health_monitor(app)
+    C.logger.info("Reason-Proxy is starting on %s:%s (health monitor loop enabled)", C.HOST, C.PORT)
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    """应用关闭时清理资源。
+
+    依次执行：
+    1. 停止后台健康监控任务（teardown_health_monitor）；
+    2. 关闭 httpx 异步客户端连接池。
+
+    Raises:
+        不会向外抛出异常；CancelledError 被静默吞掉以兼容 Starlette 关闭流程。
+    """
+    try:
+        await teardown_health_monitor(app)
+    except asyncio.CancelledError:
+        #  CancelledError  Starlette
+        pass
+    await app.state.client.aclose()
+
+
+#
+
+
+def _copy_entity_headers(resp: httpx.Response) -> Dict[str, str]:
+    """从后端响应中提取需要透传给客户端的实体头。
+
+    保留以下类别的响应头：
+    - 所有 X-* 自定义头（含后端观测头）
+    - content-type、content-encoding（保持内容编码语义）
+    - etag、last-modified（缓存验证头）
+
+    Args:
+        resp: 后端返回的 httpx.Response 对象
+
+    Returns:
+        Dict[str, str]: 筛选后的响应头字典
+    """
+    return {
+        k: v for k, v in resp.headers.items()
+        if k.lower().startswith("x-") or k.lower() in ("content-type", "content-encoding", "etag", "last-modified")
+    }
+
+
+def _merge_obs_and_retry_headers(
+        gate: QueueGate,
+        queue_headers: Dict[str, str],
+        resp: httpx.Response) -> Dict[str, str]:
+    """合并观测头与重试计数头，生成最终的附加响应头。
+
+    将排队观测头（X-InFlight、X-Queued-Wait 等）与请求重试次数
+    (X-Retry-Count) 合并为一个字典，便于一次性附加到客户端响应。
+
+    Args:
+        gate:          QueueGate 实例，提供 obs_headers() 方法
+        queue_headers: 排队阶段产生的队列相关头信息
+        resp:          后端响应对象，其 extensions 字段可能含 app_retry_count
+
+    Returns:
+        Dict[str, str]: 合并后的附加响应头字典
+    """
+    merged = gate.obs_headers(queue_headers)
+    ext = getattr(resp, "extensions", None)
+    if isinstance(ext, dict):
+        retry_cnt = ext.get("app_retry_count")
+        if retry_cnt is not None:
+            merged["X-Retry-Count"] = str(retry_cnt)
+    return merged
+
+
+def _content_length(resp: httpx.Response) -> int | None:
+    """从响应头中安全提取 Content-Length 值。
+
+    若响应头中包含合法的 Content-Length 数值字符串，则返回对应整数；
+    否则返回 None。用于非流式转发中判断是否可以一次性缓冲返回。
+
+    Args:
+        resp: 后端返回的 httpx.Response 对象
+
+    Returns:
+        int | None: 内容长度（字节），无法解析时返回 None
+    """
+    try:
+        v = resp.headers.get("content-length")
+        return int(v) if v is not None and v.isdigit() else None
+    except Exception:
+        return None
+
+
+async def _send_nonstream_request(
+    client: httpx.AsyncClient,
+    upstream_path: str,
+    body_bytes: bytes,
+    req: Request,
+    rid: str | None,
+) -> httpx.Response:
+    """向后端发送非流式请求（但以 stream=True 接收响应）。
+
+    虽然业务语义上为非流式请求，但在 HTTP 传输层仍使用 stream=True
+    来接收响应，以便后续根据 Content-Length 决定一次性读取还是按块转发，
+    从而避免大响应体撑爆内存。
+
+    Args:
+        client:        httpx 异步客户端实例
+        upstream_path: 后端路由路径（如 "/v1/chat/completions"）
+        body_bytes:    序列化后的请求体字节
+        req:           原始客户端请求对象（用于提取头信息）
+        rid:           请求 ID，用于日志追踪
+
+    Returns:
+        httpx.Response: 后端响应对象（未读取 body）
+
+    Raises:
+        HTTPException(502): 后端连接失败或持续返回 5xx
+    """
+    url = build_backend_url(upstream_path)
+    return await _send_with_fixed_retries(
+        client, "POST", url,
+        content=body_bytes,
+        headers=make_upstream_headers(req, want_gzip=False),
+        stream=True,  #
+        rid=rid,
+    )
+
+
+async def _pipe_nonstream(req: Request, r: httpx.Response, rid: str | None) -> AsyncIterator[bytes]:
+    """按块管道转发非流式响应体数据到客户端。
+
+    当非流式响应的 Content-Length 超过 NONSTREAM_THRESHOLD 阈值时，
+    改为按块流式转发，避免将大体积 JSON 响应完整缓冲在代理内存中。
+    转发过程中持续检测客户端是否已断开连接，若断开则提前终止。
+
+    Args:
+        req: 原始客户端请求对象，用于检测连接状态
+        r:   后端 httpx.Response 对象（stream 模式，未读取 body）
+        rid: 请求 ID，用于日志追踪
+
+    Yields:
+        bytes: 后端响应体的字节块
+    """
+    try:
+        async for chunk in r.aiter_bytes():
+            if not chunk:
+                continue
+            if await req.is_disconnected():
+                elog("client_disconnected_nonstream", rid=rid)
+                break
+            yield chunk
+    finally:
+        await r.aclose()
+
+
+async def _acquire_gate_early_nonstream(req: Request, gate: QueueGate, rid: str | None) -> Dict[str, str]:
+    """为非流式请求获取并立即释放排队闸门。
+
+    非流式场景下采用"早释放"策略：在发送后端请求之前先 acquire 闸门
+    以获取排队等待信息，随即 release 释放并发槽位，这样排队延迟
+    不会叠加到后端处理时间上。
+
+    Args:
+        req:  原始客户端请求对象
+        gate: QueueGate 排队控制器实例
+        rid:  请求 ID，用于日志追踪
+
+    Returns:
+        Dict[str, str]: 排队相关的头信息（如 X-Queued-Wait）
+
+    Raises:
+        HTTPException: 排队超时或并发数超限时抛出
+    """
+    queue_headers = await gate.acquire(dict(req.headers))
+    await gate.release()
+    jlog("gate_acquired_released_early", rid=rid, wait_hdr=queue_headers.get("X-Queued-Wait"))
+    return queue_headers
+
+
+async def _forward_nonstream(req: Request, upstream_path: str):
+    """完整的非流式请求转发流程。
+
+    以 stream=True 方式从后端接收响应，再根据响应体大小选择返回策略：
+    1) 读取并校验 JSON 请求体；
+    2) 获取/释放排队闸门，记录排队等待耗时；
+    3) 向后端发送请求并获取响应对象（未消费 body）；
+    4) 若 Content-Length ≤ NONSTREAM_THRESHOLD，一次性读取后以 Response 返回；
+       否则使用 StreamingResponse 按块管道转发，避免大响应撑爆内存。
+
+    Args:
+        req:           原始客户端 Request 对象
+        upstream_path: 后端路由路径（如 "/v1/chat/completions"）
+
+    Returns:
+        Response | StreamingResponse | JSONResponse:
+            正常时返回后端响应内容；排队异常时返回包含错误detail 的 JSONResponse。
+    """
+    client: httpx.AsyncClient = app.state.client
+    gate: QueueGate = app.state.gate
+    rid = req.headers.get("x-request-id")
+
+    #
+    body_bytes = await read_json_body(req, rid, MAX_REQUEST_BYTES)
+    jlog("req_recv", rid=rid, path=str(req.url.path), body_len=len(body_bytes))
+
+    #
+    try:
+        queue_headers = await _acquire_gate_early_nonstream(req, gate, rid)
+    except HTTPException as e:
+        elog("gate_acquire_error", rid=rid, status=e.status_code, detail=str(e.detail))
+        return JSONResponse(status_code=e.status_code,
+                            content={"detail": e.detail},
+                            headers=gate.obs_headers(e.headers))
+
+    #
+    r = await _send_nonstream_request(client, upstream_path, body_bytes, req, rid)
+
+    #  + /
+    merged = _merge_obs_and_retry_headers(gate, queue_headers, r)
+    entity_headers = _copy_entity_headers(r)
+
+    #
+    content_len = _content_length(r)
+    if content_len and content_len <= C.NONSTREAM_THRESHOLD:
+        data = await r.aread()
+        await r.aclose()
+        return Response(
+            data,
+            status_code=r.status_code,
+            media_type=r.headers.get("content-type", "application/json"),
+            headers={**entity_headers, **merged},
+        )
+
+    #
+    return StreamingResponse(
+        _pipe_nonstream(req, r, rid),
+        status_code=r.status_code,
+        media_type=r.headers.get("content-type", "application/json"),
+        headers={**entity_headers, **merged},
+    )
+
+
+#
+
+
+def _should_flush_first_packet(buf: bytearray, first_flush_done: bool, now: float, last_flush: float) -> bool:
+    """判断流式传输中是否应该刷出首包数据。
+
+    首包刷出策略用于优化 TTFT（首 Token 到达时间），满足以下任一条件即刷出：
+    - 缓冲区已累积 ≥ FIRST_FLUSH_BYTES 字节
+    - 启用了分隔符刷出且缓冲区包含 SSE 分隔符 "\\n\\n"
+    - 距离上次刷出已超过 FIRST_FLUSH_MS 毫秒
+
+    Args:
+        buf:              当前字节缓冲区
+        first_flush_done: 是否已完成首包刷出
+        now:              当前时间戳（perf_counter）
+        last_flush:       上次刷出的时间戳
+
+    Returns:
+        bool: True 表示应立即刷出缓冲区内容
+    """
+    if first_flush_done:
+        return False
+    if len(buf) >= C.FIRST_FLUSH_BYTES:
+        return True
+    if C.ENABLE_DELIM_FLUSH and b"\n\n" in buf:
+        return True
+    if C.FIRST_FLUSH_MS and (now - last_flush) >= C.FIRST_FLUSH_MS:
+        return True
+    return False
+
+
+def _should_flush(buf: bytearray, dyn_bytes: int, last_flush: float, now: float) -> bool:
+    """判断流式传输中是否应该刷出后续数据包。
+
+    在首包已刷出之后的常规刷出判断，满足以下任一条件即触发刷出：
+    - 缓冲区已累积 ≥ dyn_bytes 字节（含随机抖动）
+    - 启用了分隔符刷出且缓冲区包含 SSE 分隔符 "\\n\\n"
+    - 距离上次刷出已超过 STREAM_FLUSH_MS 毫秒
+
+    Args:
+        buf:        当前字节缓冲区
+        dyn_bytes:  动态字节阈值（含随机抖动，防止多连接同步刷出）
+        last_flush: 上次刷出的时间戳（perf_counter）
+        now:        当前时间戳
+
+    Returns:
+        bool: True 表示应立即刷出缓冲区内容
+    """
+    return (
+        len(buf) >= dyn_bytes or
+        (C.ENABLE_DELIM_FLUSH and b"\n\n" in buf) or
+        (now - last_flush) >= C.STREAM_FLUSH_MS
+    )
+
+
+async def _stream_gen(req: Request, r: httpx.Response, rid: str) -> AsyncIterator[bytes]:
+    """流式响应生成器：按自适应策略刷出后端 SSE 数据块。
+
+    从后端流式响应 r 中逐块读取数据，通过三级刷出策略平衡
+    首包延迟 (TTFT) 和整体吞吐：
+    1. 快速路径：首个小包（≤ FAST_PATH_BYTES）直接 yield，零延迟；
+    2. 首包策略：累积到 FIRST_FLUSH_BYTES 或遇到分隔符时尽快刷出；
+    3. 常规策略：按动态字节阈值 + 时间窗口 + 分隔符三重条件刷出。
+
+    生成器结束时自动关闭后端响应连接。
+
+    Args:
+        req: 原始客户端请求，用于检测连接断开
+        r:   后端 httpx.Response 对象（stream 模式）
+        rid: 请求 ID，用于日志追踪
+
+    Yields:
+        bytes: 刷出的字节块
+    """
+    buf = bytearray()
+    last_flush = time.perf_counter()
+    first_flush_done = False
+    dyn_base = max(C.STREAM_FLUSH_BYTES, int(C.MAX_CONN / 4))
+
+    try:
+        async for chunk in r.aiter_raw():
+            if not chunk:
+                continue
+            if await req.is_disconnected():
+                elog("client_disconnected_stream", rid=rid)
+                break
+
+            #
+            if not first_flush_done and len(chunk) <= C.FAST_PATH_BYTES:
+                yield chunk
+                first_flush_done = True
+                continue
+
+            buf.extend(chunk)
+            now = time.perf_counter()
+
+            #  flush
+            if _should_flush_first_packet(buf, first_flush_done, now, last_flush):
+                yield bytes(buf)
+                buf.clear()
+                first_flush_done = True
+                last_flush = now
+                continue
+
+            #  flush +  +
+            dyn_bytes = dyn_base + random.randint(0, max(1, dyn_base // 8))
+            if _should_flush(buf, dyn_bytes, last_flush, now):
+                yield bytes(buf)
+                buf.clear()
+                last_flush = now
+    finally:
+        if buf:
+            yield bytes(buf)
+        await r.aclose()
+
+
+def _build_passthrough_headers(r: httpx.Response, gate: QueueGate, queue_headers: Dict[str, str]) -> Dict[str, str]:
+    """构建流式响应的透传头集合。
+
+    合并以下头信息用于 SSE/Chunked 流式响应：
+    - 后端返回的所有 X-* 自定义头
+    - X-Retry-Count（若发生了重试）
+    - X-Accel-Buffering: no（禁止 Nginx 缓冲 SSE）
+    - Cache-Control: no-transform（防止中间代理压缩 SSE）
+    - 排队观测头（X-InFlight、X-Queued-Wait 等）
+
+    Args:
+        r:              后端 httpx.Response 对象
+        gate:           QueueGate 排队控制器实例
+        queue_headers:  排队阶段产生的头信息
+
+    Returns:
+        Dict[str, str]: 合并后的完整透传头字典
+    """
+    headers = {k: v for k, v in r.headers.items() if k.lower().startswith("x-")}
+
+    ext = getattr(r, "extensions", None)
+    if isinstance(ext, dict):
+        retry_cnt = ext.get("app_retry_count")
+        if retry_cnt is not None:
+            headers["X-Retry-Count"] = str(retry_cnt)
+
+    headers.setdefault("X-Accel-Buffering", "no")
+    headers.setdefault("Cache-Control", "no-transform")
+    headers.update(gate.obs_headers(queue_headers))
+    return headers
+
+
+async def _send_stream_request(
+    client: httpx.AsyncClient,
+    upstream_path: str,
+    body_bytes: bytes,
+    req: Request,
+    rid: str,
+) -> httpx.Response:
+    """向后端发送流式请求并返回流式响应对象。
+
+    使用专用的超时配置：connect 超时较短以快速发现后端不可达，
+    read 超时为 None（流式场景下无法预估完整响应时长），
+    write/pool 使用全局默认值。
+
+    Args:
+        client:        httpx 异步客户端实例
+        upstream_path: 后端路由路径（如 "/v1/chat/completions"）
+        body_bytes:    序列化后的请求体字节
+        req:           原始客户端请求对象（用于提取头信息）
+        rid:           请求 ID，用于日志追踪
+
+    Returns:
+        httpx.Response: 后端流式响应对象（未消费 body）
+
+    Raises:
+        HTTPException(502): 后端连接失败或持续返回 5xx
+    """
+    url = build_backend_url(upstream_path)
+    return await _send_with_fixed_retries(
+        client, "POST", url,
+        content=body_bytes,
+        headers=make_upstream_headers(req, want_gzip=False),
+        stream=True,
+        timeout=httpx.Timeout(
+            connect=C.STREAM_BACKEND_CONNECT_TIMEOUT,
+            read=None,
+            write=C.HTTPX_WRITE_TIMEOUT,
+            pool=C.HTTPX_POOL_TIMEOUT,
+        ),
+        rid=rid,
+    )
+
+
+async def _acquire_gate_early(req: Request, gate: QueueGate, rid: str) -> Dict[str, str]:
+    """为流式请求获取并立即释放排队闸门。
+
+    与非流式版本 (_acquire_gate_early_nonstream) 逻辑相同：
+    采用"早释放"策略，在发送后端请求前先通过闸门排队，获取排队
+    等待信息后立即释放并发槽位，避免长时间流式传输期间占用闸门。
+
+    Args:
+        req:  原始客户端请求对象
+        gate: QueueGate 排队控制器实例
+        rid:  请求 ID，用于日志追踪
+
+    Returns:
+        Dict[str, str]: 排队相关的头信息（如 X-Queued-Wait）
+
+    Raises:
+        HTTPException: 排队超时或并发数超限时抛出
+    """
+    queue_headers = await gate.acquire(dict(req.headers))
+    await gate.release()
+    jlog("gate_acquired_released_early", rid=rid, wait_hdr=queue_headers.get("X-Queued-Wait"))
+    return queue_headers
+
+
+async def _forward_stream(req: Request, upstream_path: str):
+    """完整的流式请求转发流程（SSE / Chunked Transfer）。
+
+    处理步骤：
+    1. 读取并校验 JSON 请求体；
+    2. 获取/释放排队闸门，记录排队等待耗时；
+    3. 向后端发送请求并获取流式响应对象；
+    4. 构建透传头（X-*、SSE 禁缓冲等）；
+    5. 以 StreamingResponse 包装 _stream_gen 生成器返回给客户端。
+
+    失败处理：
+    - 排队异常时直接返回 JSONResponse 错误；
+    - 后端连接失败时由 _send_with_fixed_retries 重试后抛出 502。
+
+    Args:
+        req:           原始客户端 Request 对象
+        upstream_path: 后端路由路径（如 "/v1/chat/completions"）
+
+    Returns:
+        StreamingResponse | JSONResponse:
+            正常时返回 SSE 流式响应；排队异常时返回错误 JSONResponse。
+    """
+    client: httpx.AsyncClient = app.state.client
+    gate: QueueGate = app.state.gate
+    rid = req.headers.get("x-request-id")
+
+    body_bytes = await read_json_body(req, rid, MAX_REQUEST_BYTES)
+    jlog("req_recv", rid=rid, path=str(req.url.path), body_len=len(body_bytes))
+
+    try:
+        queue_headers = await _acquire_gate_early(req, gate, rid)
+    except HTTPException as e:
+        elog("gate_acquire_error", rid=rid, status=e.status_code, detail=str(e.detail))
+        return JSONResponse(
+            status_code=e.status_code,
+            content={"detail": e.detail},
+            headers=gate.obs_headers(e.headers)
+        )
+
+    r = await _send_stream_request(client, upstream_path, body_bytes, req, rid)
+
+    passthrough = _build_passthrough_headers(r, gate, queue_headers)
+    return StreamingResponse(
+        _stream_gen(req, r, rid),
+        status_code=r.status_code,
+        media_type=r.headers.get("content-type", "text/event-stream"),
+        headers=passthrough,
+    )
+
+
+# 某些模型或前端调用习惯下，需要强制补齐 top_k/top_p，避免默认值差异。
+FORCE_TOPK_TOPP = want_topk("WINGS_FORCE_CHAT_TOPK_TOPP", "1")  #
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: Request):
+    """聊天补全接口，根据 `stream` 字段自动切换转发路径。"""
+    rid = req.headers.get("x-request-id")
+    try:
+        payload: Dict[str, Any] = await req.json()
+    except Exception as e:
+        elog("chat_json_parse_error", rid=rid, detail=str(e))
+        payload = {}
+
+    # 对聊天接口做可选参数修正，保证代理后的采样行为一致。
+    if FORCE_TOPK_TOPP and isinstance(payload, dict):
+        payload["top_k"] = -1
+        payload["top_p"] = 1
+        req = rebuild_request_json(req, payload)
+
+    if want_stream(payload.get("stream", False)):
+        return await _forward_stream(req, "/v1/chat/completions")
+    return await _forward_nonstream(req, "/v1/chat/completions")
+
+
+@app.post("/v1/completions")
+async def completions(req: Request):
+    """传统 completion 接口。"""
+    rid = req.headers.get("x-request-id")
+    try:
+        payload: Dict[str, Any] = await req.json()
+    except Exception as e:
+        elog("completions_json_parse_error", rid=rid, detail=str(e))
+        payload = {}
+    if want_stream(payload.get("stream", False)):
+        return await _forward_stream(req, "/v1/completions")
+    return await _forward_nonstream(req, "/v1/completions")
+
+
+@app.post("/v1/responses")
+async def responses(req: Request):
+    """Responses API 兼容入口。"""
+    rid = req.headers.get("x-request-id")
+    try:
+        payload: Dict[str, Any] = await req.json()
+    except Exception as e:
+        elog("responses_json_parse_error", rid=rid, detail=str(e))
+        payload = {}
+    if want_stream(payload.get("stream", False)):
+        return await _forward_stream(req, "/v1/responses")
+    return await _forward_nonstream(req, "/v1/responses")
+
+
+@app.post("/v1/rerank")
+async def rerank(req: Request):
+    """重排序接口，将请求透传到后端 /v1/rerank 端点。"""
+    return await _forward_nonstream(req, "/v1/rerank")
+
+
+@app.post("/v1/embeddings")
+async def embeddings(req: Request):
+    """向量嵌入接口，将请求透传到后端 /v1/embeddings 端点。"""
+    return await _forward_nonstream(req, "/v1/embeddings")
+
+
+@app.post("/tokenize")
+async def tokenize(req: Request):
+    """分词接口，将请求透传到 vLLM 后端的 /tokenize 端点。"""
+    return await _forward_nonstream(req, "/tokenize")
+
+
+def _extract_metrics_headers(r: httpx.Response) -> dict:
+    """保留 metrics 所需的关键响应头。"""
+    headers = {k: v for k, v in r.headers.items() if k.lower().startswith("x-")}
+    headers["Content-Type"] = r.headers.get(
+        "content-type",
+        "text/plain; version=0.0.4; charset=utf-8",
+    )
+    return headers
+
+
+async def _pipe_metrics(req: Request, r: httpx.Response):
+    """按块回传 metrics 数据。"""
+    try:
+        async for chunk in r.aiter_bytes():
+            if not chunk:
+                continue
+            if await req.is_disconnected():
+                elog("client_disconnected_metrics", rid=req.headers.get("x-request-id"))
+                break
+            yield chunk
+    finally:
+        await r.aclose()
+
+
+@app.get("/metrics")
+async def metrics(req: Request):
+    """透传 backend 的 `/metrics`。"""
+    client: httpx.AsyncClient = app.state.client
+    url = build_backend_url("/metrics")
+
+    r = await _send_with_fixed_retries(
+        client, "GET", url,
+        headers=make_upstream_headers(req, want_gzip=False),
+        stream=True,
+        timeout=httpx.Timeout(
+            connect=C.METRICS_CONNECT_TIMEOUT,
+            read=None,
+            write=C.HTTPX_WRITE_TIMEOUT,
+            pool=C.HTTPX_POOL_TIMEOUT,
+        ),
+        rid=req.headers.get("x-request-id"),
+    )
+
+    headers = _extract_metrics_headers(r)
+    return StreamingResponse(
+        _pipe_metrics(req, r),
+        status_code=r.status_code,
+        headers=headers,
+    )
+
+
+@app.post("/v1/videos/text2video")
+async def hv_text2video(req: Request):
+    """HunyuanVideo 的创建任务接口。"""
+    return await _forward_nonstream(req, "/v1/videos/text2video")
+
+
+@app.get("/v1/videos/text2video/{task_id}")
+async def hv_text2video_status(task_id: str, req: Request):
+    """查询 HunyuanVideo 异步任务状态。"""
+    client: httpx.AsyncClient = app.state.client
+    rid = req.headers.get("x-request-id")
+    url = build_backend_url(f"/v1/videos/text2video/{task_id}")
+
+    #  JSON
+    r = await _send_with_fixed_retries(
+        client, "GET", url,
+        headers=make_upstream_headers(req, want_gzip=False),
+        stream=True,  #
+        timeout=httpx.Timeout(
+            connect=C.STATUS_CONNECT_TIMEOUT,
+            read=C.STATUS_READ_TIMEOUT,
+            write=C.HTTPX_WRITE_TIMEOUT,
+            pool=C.HTTPX_POOL_TIMEOUT,
+        ),
+        rid=rid,
+    )
+
+    entity_headers = _copy_entity_headers(r)
+    data = await r.aread()
+    await r.aclose()
+    return Response(
+        data,
+        status_code=r.status_code,
+        media_type=r.headers.get("content-type", "application/json"),
+        headers=entity_headers,
+    )
+
+# `/health` 返回的是 health 状态机的当前快照，而不是现场临时探测。
+
+
+@app.get("/health")
+async def health_get(request: Request):
+    """返回完整健康状态 JSON。"""
+    h = app.state.health
+    code = map_http_code_from_state(h)
+    headers = build_health_headers(h)
+    body = build_health_body(h, code)
+    return JSONResponse(status_code=code, content=body, headers=headers)
+
+
+@app.head("/health")
+async def health_head(request: Request):
+    """返回仅含状态码和头部的健康检查结果，适合 K8s 探针。"""
+    h = app.state.health
+    code = map_http_code_from_state(h)
+    headers = build_health_headers(h)
+    return Response(status_code=code, headers=headers)
+
+
+# 模型列表接口直接透传 backend，便于前端/SDK 获取当前已加载模型。
+
+
+@app.get("/v1/models")
+async def models_proxy(request: Request):
+    """模型列表查询接口。"""
+    rid = request.headers.get("x-request-id")
+    url = build_backend_url("/v1/models")
+    try:
+        upstream_headers = make_upstream_headers(request)
+        resp = await app.state.client.get(url, headers=upstream_headers, timeout=10.0)
+        entity_headers = _copy_entity_headers(resp)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=entity_headers,
+            media_type=resp.headers.get("content-type", "application/json"),
+        )
+    except Exception as e:
+        elog("models_proxy_error", rid=rid, detail=str(e))
+        raise HTTPException(status_code=502, detail=f"Backend unavailable: {e}")
+
+
+@app.get("/v1/version")
+async def version_proxy(req: Request):
+    """返回 sidecar 自身版本信息，便于部署排查。"""
+    rid = req.headers.get("x-request-id")
+
+    version = os.getenv("WINGS_VERSION", "25.0.0.1")
+    build_date = os.getenv("WINGS_BUILD_DATE", "2025-08-30")
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "WINGS_VERSION": version,
+            "WINGS_BUILD_DATE": build_date
+        }
+    )

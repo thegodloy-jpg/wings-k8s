@@ -1,0 +1,159 @@
+# SGLang 单机验证部署
+# 机器: 7.6.52.148 (k3s 节点 ca4109381399)
+# GPU: NVIDIA A100-PCIE-40GB (UUID: GPU-3ad4c258-3338-a49d-b6db-5059e89d9811)
+# 引擎镜像: sglang-infer:zhanghui-20260228
+# 控制镜像: wings-infer:dist-nv-dev-zhanghui
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infer-sglang
+  namespace: wings-infer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: infer-sglang
+  template:
+    metadata:
+      labels:
+        app: infer-sglang
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: ca4109381399
+      volumes:
+      - name: shared-volume
+        emptyDir: {}
+      - name: model-volume
+        hostPath:
+          path: /mnt/models
+          type: DirectoryOrCreate
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Gi
+      - name: dev-nvidia0
+        hostPath:
+          path: /dev/nvidia0
+          type: CharDevice
+      - name: dev-nvidiactl
+        hostPath:
+          path: /dev/nvidiactl
+          type: CharDevice
+      - name: dev-nvidia-uvm
+        hostPath:
+          path: /dev/nvidia-uvm
+          type: CharDevice
+      - name: nvidia-libs
+        hostPath:
+          path: /mnt/nvidia-libs
+          type: Directory
+      containers:
+      # ── 控制容器 (wings-infer) ─────────────────────────────────────────────
+      - name: wings-infer
+        image: wings-infer:dist-nv-dev-zhanghui
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 18000
+          name: proxy
+        - containerPort: 19000
+          name: health
+        env:
+        - name: ENGINE
+          value: "sglang"
+        - name: MODEL_NAME
+          value: "DeepSeek-R1-Distill-Qwen-1.5B"
+        - name: MODEL_PATH
+          value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+        - name: ENGINE_PORT
+          value: "17000"
+        - name: PORT
+          value: "18000"
+        - name: HEALTH_PORT
+          value: "19000"
+        - name: WINGS_SKIP_PID_CHECK
+          value: "true"
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        volumeMounts:
+        - name: shared-volume
+          mountPath: /shared-volume
+        - name: model-volume
+          mountPath: /models
+          readOnly: true
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+      # ── 引擎容器 (sglang-engine) ───────────────────────────────────────────
+      - name: sglang-engine
+        image: sglang-infer:zhanghui-20260228
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          export CUDA_DEVICE_ORDER=PCI_BUS_ID
+          export CUDA_VISIBLE_DEVICES=GPU-3ad4c258-3338-a49d-b6db-5059e89d9811
+          export LD_LIBRARY_PATH=/usr/lib/nvidia-host:${LD_LIBRARY_PATH:-}
+          export PATH=/usr/lib/nvidia-host:${PATH}
+          echo '[engine] Waiting for start_command.sh...'
+          while [ ! -f /shared-volume/start_command.sh ]; do sleep 2; done
+          echo '[engine] Executing:'
+          cat /shared-volume/start_command.sh
+          cd /shared-volume && bash start_command.sh
+        env:
+        - name: CUDA_DEVICE_ORDER
+          value: "PCI_BUS_ID"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "GPU-3ad4c258-3338-a49d-b6db-5059e89d9811"
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "GPU-3ad4c258-3338-a49d-b6db-5059e89d9811"
+        volumeMounts:
+        - name: shared-volume
+          mountPath: /shared-volume
+        - name: model-volume
+          mountPath: /models
+          readOnly: true
+        - name: dev-nvidia0
+          mountPath: /dev/nvidia0
+        - name: dev-nvidiactl
+          mountPath: /dev/nvidiactl
+        - name: dev-nvidia-uvm
+          mountPath: /dev/nvidia-uvm
+        - name: nvidia-libs
+          mountPath: /usr/lib/nvidia-host
+        - name: dshm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            cpu: "4"
+            memory: 8Gi
+          limits:
+            cpu: "24"
+            memory: 64Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-sglang-svc
+  namespace: wings-infer
+spec:
+  type: NodePort
+  selector:
+    app: infer-sglang
+  ports:
+  - port: 18000
+    targetPort: 18000
+    nodePort: 31800
+    name: proxy
+  - port: 19000
+    targetPort: 19000
+    nodePort: 31900
+    name: health

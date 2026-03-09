@@ -1,0 +1,4 @@
+1. 新旧版本也就是，旧版本F:\zhanghui\wings-k8s-260309\infer-control-sidecar-unified - analyse-wings-k8s\wings和新版本F:\zhanghui\wings-k8s-260309\infer-control-sidecar-unified - analyse-wings-k8s，基本功能的差异有哪些，我这里关注的是类似分布式，不同硬件支持，以及pd分离类似。
+2. 当前新版本wings-infer和k8s间传参逻辑的梳理，我这样问的原因是，wings-infer需要对立交付，也就是k8s部分需要别人提供，也就是除了管基本的共享卷的处理逻辑，以及加速accl部分的同步外，还有其他要传递的么
+3.加速模块的使用逻辑
+4.日志逻辑的梳理。这个我希望参考老版本的的处理方式，也就是proxy日志独立出来，然后剩余部分包括wings-infer部分以及引擎段的，都可以使用kubectl logs -f查看到。

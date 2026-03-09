@@ -1,0 +1,320 @@
+# vLLM DP (Data Parallel) 双机分布式验证部署
+# 机器布局:
+#   rank-0 (head): 7.6.52.148  (k3s 节点 ca4109381399), GPU nvidia1 (L20)
+#   rank-1 (worker): 7.6.16.150 (k3s 节点 5b590a43256c), GPU nvidia1 (RTX4090 24GB)
+# 通信端口: RPC 13355 (head 监听，worker 连接到 7.6.52.148:13355)
+# 接入方式: curl http://10.43.156.174:18000 (infer-api Service)
+#
+# 为确保 rank-0 在 .148 (HEAD_NODE_ADDR), 使用两个独立 StatefulSet。
+# head SS: nodeSelector 强制调度到 ca4109381399 (.148)
+# worker SS: nodeSelector 强制调度到 5b590a43256c (.150)
+---
+# ── HEAD (rank-0): .148 ca4109381399 ─────────────────────────────────────────
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: infer-dp-head
+  namespace: wings-infer
+spec:
+  serviceName: infer-hl
+  replicas: 1
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infer-vllm-dp
+      infer-dp-role: head
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infer-vllm-dp
+        infer-dp-role: head
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: ca4109381399
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      volumes:
+      - name: shared-volume
+        emptyDir: {}
+      - name: model-volume
+        hostPath:
+          path: /mnt/models
+          type: DirectoryOrCreate
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+      - name: dev-nvidia1
+        hostPath:
+          path: /dev/nvidia1
+          type: CharDevice
+      - name: dev-nvidiactl
+        hostPath:
+          path: /dev/nvidiactl
+          type: CharDevice
+      - name: dev-nvidia-uvm
+        hostPath:
+          path: /dev/nvidia-uvm
+          type: CharDevice
+      - name: nvidia-libs
+        hostPath:
+          path: /mnt/nvidia-libs
+          type: Directory
+      containers:
+      - name: wings-infer
+        image: wings-infer:dist-nv-dev-zhanghui
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 18000
+          name: proxy
+        - containerPort: 19000
+          name: health
+        env:
+        - name: DISTRIBUTED
+          value: "true"
+        - name: NNODES
+          value: "2"
+        - name: NODE_RANK
+          value: "0"
+        - name: HEAD_NODE_ADDR
+          # head 绑定 bridge IP 172.17.0.3；.148 物理机 iptables DNAT: 7.6.52.148:13355 → 172.17.0.3:13355
+          value: "172.17.0.3"
+        - name: NODE_IPS
+          # 仅填 head 的 IP（1个条目），使 n_nodes=1 → tensor_parallel_size=device_count=1
+          # dp_deployment 模式不使用 NODE_IPS 进行分布式通信（依赖 HEAD_NODE_ADDR:13355）
+          value: "7.6.52.148"
+        - name: ENGINE
+          value: vllm
+        - name: DISTRIBUTED_EXECUTOR_BACKEND
+          value: dp_deployment
+        - name: TENSOR_PARALLEL_SIZE
+          value: "1"
+        - name: MODEL_NAME
+          value: DeepSeek-R1-Distill-Qwen-1.5B
+        - name: MODEL_PATH
+          value: /models/DeepSeek-R1-Distill-Qwen-1.5B
+        - name: ENGINE_PORT
+          value: "17000"
+        - name: PORT
+          value: "18000"
+        - name: HEALTH_PORT
+          value: "19000"
+        - name: WINGS_SKIP_PID_CHECK
+          value: "true"
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        volumeMounts:
+        - name: shared-volume
+          mountPath: /shared-volume
+        - name: model-volume
+          mountPath: /models
+          readOnly: true
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+      - name: engine
+        image: vllm/vllm-openai:v0.13.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo 'aW1wb3J0IG9zCnBhdGggPSAnL3Vzci9sb2NhbC9saWIvcHl0aG9uMy4xMi9kaXN0LXBhY2thZ2VzL3ZsbG0vY29uZmlnL3BhcmFsbGVsLnB5Jwp3aXRoIG9wZW4ocGF0aCkgYXMgZjoKICAgIGNvbnRlbnQgPSBmLnJlYWQoKQpvbGQgPSAnICAgICAgICAgICAgICAgIHNlbGYuX2RhdGFfcGFyYWxsZWxfbWFzdGVyX3BvcnRfbGlzdCA9IGdldF9vcGVuX3BvcnRzX2xpc3QoNSknCm5ldyA9ICIgICAgICAgICAgICAgICAgX2ZwID0gb3MuZW52aXJvbi5nZXQoJ1ZMTE1fRFBfRklYRURfUE9SVFMnLCAnJylcbiAgICAgICAgICAgICAgICBzZWxmLl9kYXRhX3BhcmFsbGVsX21hc3Rlcl9wb3J0X2xpc3QgPSBsaXN0KG1hcChpbnQsIF9mcC5zcGxpdCgnLCcpKSkgaWYgX2ZwIGVsc2UgZ2V0X29wZW5fcG9ydHNfbGlzdCg1KSIKaWYgb2xkIGluIGNvbnRlbnQ6CiAgICB3aXRoIG9wZW4ocGF0aCwgJ3cnKSBhcyBmOgogICAgICAgIGYud3JpdGUoY29udGVudC5yZXBsYWNlKG9sZCwgbmV3LCAxKSkKICAgIHByaW50KCdbcGF0Y2hdIHBhcmFsbGVsLnB5IFBBVENIRUQgT0snKQplbGlmICdWTExNX0RQX0ZJWEVEX1BPUlRTJyBpbiBjb250ZW50OgogICAgcHJpbnQoJ1twYXRjaF0gcGFyYWxsZWwucHkgYWxyZWFkeSBwYXRjaGVkJykKZWxzZToKICAgIHByaW50KCdbcGF0Y2hdIFdBUk5JTkc6IHBhdHRlcm4gbm90IGZvdW5kJykK' | base64 -d | python3 -
+          echo '[engine] Waiting for start_command.sh...'
+          while [ ! -f /shared-volume/start_command.sh ]; do sleep 2; done
+          echo '[engine] Executing:'
+          cat /shared-volume/start_command.sh
+          export LD_LIBRARY_PATH=/mnt/nvidia-libs:${LD_LIBRARY_PATH:-}
+          cd /shared-volume && bash start_command.sh
+        env:
+        - name: CUDA_VISIBLE_DEVICES
+          value: "1"
+        - name: VLLM_DP_FIXED_PORTS
+          value: "13357,13358,13359,13360,13361"
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        volumeMounts:
+        - name: shared-volume
+          mountPath: /shared-volume
+        - name: model-volume
+          mountPath: /models
+          readOnly: true
+        - name: dev-nvidia1
+          mountPath: /dev/nvidia1
+        - name: dev-nvidiactl
+          mountPath: /dev/nvidiactl
+        - name: dev-nvidia-uvm
+          mountPath: /dev/nvidia-uvm
+        - name: nvidia-libs
+          mountPath: /mnt/nvidia-libs
+        - name: dshm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            cpu: "4"
+            memory: 8Gi
+          limits:
+            cpu: "24"
+            memory: 64Gi
+---
+# ── WORKER (rank-1): .150 5b590a43256c ───────────────────────────────────────
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: infer-dp-worker
+  namespace: wings-infer
+spec:
+  serviceName: infer-hl
+  replicas: 1
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infer-vllm-dp
+      infer-dp-role: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infer-vllm-dp
+        infer-dp-role: worker
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: 5b590a43256c
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      volumes:
+      - name: shared-volume
+        emptyDir: {}
+      - name: model-volume
+        hostPath:
+          path: /mnt/models
+          type: DirectoryOrCreate
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+      - name: dev-nvidia1
+        hostPath:
+          path: /dev/nvidia1
+          type: CharDevice
+      - name: dev-nvidiactl
+        hostPath:
+          path: /dev/nvidiactl
+          type: CharDevice
+      - name: dev-nvidia-uvm
+        hostPath:
+          path: /dev/nvidia-uvm
+          type: CharDevice
+      - name: nvidia-libs
+        hostPath:
+          path: /mnt/nvidia-libs
+          type: Directory
+      containers:
+      - name: wings-infer
+        image: wings-infer:dist-nv-dev-zhanghui
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 18000
+          name: proxy
+        - containerPort: 19000
+          name: health
+        env:
+        - name: DISTRIBUTED
+          value: "true"
+        - name: NNODES
+          value: "2"
+        - name: NODE_RANK
+          value: "1"
+        - name: HEAD_NODE_ADDR
+          # worker 通过物理 IP 连接到 head：7.6.52.148:13355（.148 物理机 iptables → 172.17.0.3:13355）
+          value: "7.6.52.148"
+        # NODE_IPS 只填本节点 IP → n_nodes=1 → TP=device_count=1
+        - name: NODE_IPS
+          value: "7.6.16.150"
+        - name: ENGINE
+          value: vllm
+        - name: DISTRIBUTED_EXECUTOR_BACKEND
+          value: dp_deployment
+        - name: TENSOR_PARALLEL_SIZE
+          value: "1"
+        - name: MODEL_NAME
+          value: DeepSeek-R1-Distill-Qwen-1.5B
+        - name: MODEL_PATH
+          value: /models/DeepSeek-R1-Distill-Qwen-1.5B
+        - name: ENGINE_PORT
+          value: "17000"
+        - name: PORT
+          value: "18000"
+        - name: HEALTH_PORT
+          value: "19000"
+        - name: WINGS_SKIP_PID_CHECK
+          value: "true"
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        volumeMounts:
+        - name: shared-volume
+          mountPath: /shared-volume
+        - name: model-volume
+          mountPath: /models
+          readOnly: true
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+      - name: engine
+        image: vllm/vllm-openai:v0.13.0
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo 'aW1wb3J0IG9zCnBhdGggPSAnL3Vzci9sb2NhbC9saWIvcHl0aG9uMy4xMi9kaXN0LXBhY2thZ2VzL3ZsbG0vY29uZmlnL3BhcmFsbGVsLnB5Jwp3aXRoIG9wZW4ocGF0aCkgYXMgZjoKICAgIGNvbnRlbnQgPSBmLnJlYWQoKQpvbGQgPSAnICAgICAgICAgICAgICAgIHNlbGYuX2RhdGFfcGFyYWxsZWxfbWFzdGVyX3BvcnRfbGlzdCA9IGdldF9vcGVuX3BvcnRzX2xpc3QoNSknCm5ldyA9ICIgICAgICAgICAgICAgICAgX2ZwID0gb3MuZW52aXJvbi5nZXQoJ1ZMTE1fRFBfRklYRURfUE9SVFMnLCAnJylcbiAgICAgICAgICAgICAgICBzZWxmLl9kYXRhX3BhcmFsbGVsX21hc3Rlcl9wb3J0X2xpc3QgPSBsaXN0KG1hcChpbnQsIF9mcC5zcGxpdCgnLCcpKSkgaWYgX2ZwIGVsc2UgZ2V0X29wZW5fcG9ydHNfbGlzdCg1KSIKaWYgb2xkIGluIGNvbnRlbnQ6CiAgICB3aXRoIG9wZW4ocGF0aCwgJ3cnKSBhcyBmOgogICAgICAgIGYud3JpdGUoY29udGVudC5yZXBsYWNlKG9sZCwgbmV3LCAxKSkKICAgIHByaW50KCdbcGF0Y2hdIHBhcmFsbGVsLnB5IFBBVENIRUQgT0snKQplbGlmICdWTExNX0RQX0ZJWEVEX1BPUlRTJyBpbiBjb250ZW50OgogICAgcHJpbnQoJ1twYXRjaF0gcGFyYWxsZWwucHkgYWxyZWFkeSBwYXRjaGVkJykKZWxzZToKICAgIHByaW50KCdbcGF0Y2hdIFdBUk5JTkc6IHBhdHRlcm4gbm90IGZvdW5kJykK' | base64 -d | python3 -
+          echo '[engine] Waiting for start_command.sh...'
+          while [ ! -f /shared-volume/start_command.sh ]; do sleep 2; done
+          echo '[engine] Executing:'
+          cat /shared-volume/start_command.sh
+          export LD_LIBRARY_PATH=/mnt/nvidia-libs:${LD_LIBRARY_PATH:-}
+          cd /shared-volume && bash start_command.sh
+        env:
+        - name: CUDA_VISIBLE_DEVICES
+          value: "1"
+        - name: VLLM_DP_FIXED_PORTS
+          value: "13357,13358,13359,13360,13361"
+              fieldPath: status.podIP
+        volumeMounts:
+        - name: shared-volume
+          mountPath: /shared-volume
+        - name: model-volume
+          mountPath: /models
+          readOnly: true
+        - name: dev-nvidia1
+          mountPath: /dev/nvidia1
+        - name: dev-nvidiactl
+          mountPath: /dev/nvidiactl
+        - name: dev-nvidia-uvm
+          mountPath: /dev/nvidia-uvm
+        - name: nvidia-libs
+          mountPath: /mnt/nvidia-libs
+        - name: dshm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            cpu: "4"
+            memory: 8Gi
+          limits:
+            cpu: "24"
+            memory: 64Gi

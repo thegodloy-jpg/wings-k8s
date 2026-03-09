@@ -1,0 +1,193 @@
+# =============================================================================
+# 文件: proxy/settings.py
+# 用途: 代理运行时配置
+# 状态: 活跃，部分参数可通过环境变量覆盖
+#
+# 功能概述:
+#   本模块集中管理代理层的运行时配置，包括：
+#   - 后端地址和探测超时
+#   - 流式响应刷新策略 (TTFT 优化)
+#   - HTTP 客户端连接池配置
+#   - 重试策略
+#   - 并发控制和排队参数
+#
+# 默认值设计原则:
+#   - 稳定性优先：避免激进的连接池配置
+#   - 默认禁用 HTTP/2：部分上游引擎在 HTTP/1.1 上更稳定
+#   - 流式场景对瞬时传输问题比较敏感
+#
+# =============================================================================
+# -*- coding: utf-8 -*-
+"""Proxy 运行时配置。
+
+默认值优先考虑稳定性：
+- 避免过于激进的连接池配置
+- 默认禁用 HTTP/2（部分上游引擎在 HTTP/1.1 上更稳定）
+- 流式 chat 流量对瞬时传输问题比较敏感
+"""
+
+import argparse
+import logging
+import os
+
+if not logging.root.handlers:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+logger = logging.getLogger("reason-proxy")
+
+
+def parse_args():
+    """解析代理专属的命令行参数，保留 launcher 的参数不受影响。
+
+    支持的参数:
+        --backend: 后端引擎地址 (BACKEND_URL)
+        --host:    代理监听地址 (HOST)
+        --port:    代理监听端口 (PORT)
+
+    Returns:
+        argparse.Namespace: 解析后的参数对象
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--backend", default=os.getenv("BACKEND_URL", "http://127.0.0.1:17000"))
+    parser.add_argument("--host", default=os.getenv("HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "18000")))
+    args, _ = parser.parse_known_args()
+    return args
+
+
+args = parse_args()
+BACKEND_URL = args.backend.strip()
+HOST = args.host
+PORT = args.port
+
+BACKEND_PROBE_TIMEOUT = int(os.getenv("BACKEND_PROBE_TIMEOUT", "3600"))
+
+# Do not inherit system proxy settings for local backend traffic.
+logger.info("Clearing system proxy environment variables to prevent httpx from picking them up")
+for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"):
+    os.environ.pop(key, None)
+
+# Streaming flush policy.
+FAST_PATH_BYTES = int(os.getenv("FAST_PATH_BYTES", "128"))
+FIRST_FLUSH_BYTES = int(os.getenv("FIRST_FLUSH_BYTES", "256"))
+FIRST_FLUSH_MS = float(os.getenv("FIRST_FLUSH_MS", "0.0"))
+STREAM_FLUSH_BYTES = int(os.getenv("STREAM_FLUSH_BYTES", "8192"))
+STREAM_FLUSH_MS = float(os.getenv("STREAM_FLUSH_MS", "0.006"))
+NONSTREAM_THRESHOLD = int(os.getenv("NONSTREAM_PIPE_THRESHOLD", str(256 * 1024)))
+
+# Connection pool defaults (aligned with wings production defaults).
+MAX_CONN = int(os.getenv("HTTPX_MAX_CONNECTIONS", "2048"))
+MAX_KEEPALIVE = int(os.getenv("HTTPX_MAX_KEEPALIVE", "256"))
+KEEPALIVE_EXPIRY = float(os.getenv("HTTPX_KEEPALIVE_EXPIRY", "30"))
+
+# HTTP/2 enabled by default (aligned with wings production defaults).
+HTTP2_ENABLED = os.getenv("HTTP2_ENABLED", "true").lower() != "false"
+H2_MAX_STREAMS = int(os.getenv("HTTP2_MAX_STREAMS", "128"))
+
+# Retry policy for transient backend errors (aligned with wings: 3 tries, 100ms interval).
+RETRY_TRIES = int(os.getenv("RETRY_TRIES", "3"))
+RETRY_INTERVAL_MS = int(os.getenv("RETRY_INTERVAL_MS", "100"))
+ENABLE_DELIM_FLUSH = os.getenv("ENABLE_DELIM_FLUSH", "true").lower() != "false"
+
+# Client and per-endpoint timeout tuning.
+HTTPX_CONNECT_TIMEOUT = float(os.getenv("HTTPX_CONNECT_TIMEOUT", "20"))
+HTTPX_WRITE_TIMEOUT = float(os.getenv("HTTPX_WRITE_TIMEOUT", "20"))
+HTTPX_POOL_TIMEOUT = float(os.getenv("HTTPX_POOL_TIMEOUT", "30"))
+STREAM_BACKEND_CONNECT_TIMEOUT = float(os.getenv("STREAM_BACKEND_CONNECT_TIMEOUT", "20"))
+METRICS_CONNECT_TIMEOUT = float(os.getenv("METRICS_CONNECT_TIMEOUT", "10"))
+STATUS_CONNECT_TIMEOUT = float(os.getenv("STATUS_CONNECT_TIMEOUT", "10"))
+STATUS_READ_TIMEOUT = float(os.getenv("STATUS_READ_TIMEOUT", "30"))
+
+WARMUP_CONN = int(os.getenv("WARMUP_CONN", str(min(MAX_KEEPALIVE or 50, 200))))
+WARMUP_PROMPT = os.getenv("WARMUP_PROMPT", "").strip()
+WARMUP_ROUNDS = int(os.getenv("WARMUP_ROUNDS", "1"))
+WARMUP_TIMEOUT = float(os.getenv("WARMUP_TIMEOUT", "10"))
+
+GLOBAL_PASS_THROUGH_LIMIT = int(os.getenv("GLOBAL_PASS_THROUGH_LIMIT", "1024"))
+GLOBAL_QUEUE_MAXSIZE = int(os.getenv("GLOBAL_QUEUE_MAXSIZE", "1024"))
+
+WORKERS = int(os.getenv("PROXY_WORKERS", "1"))
+WORKER_INDEX = int(os.getenv("WORKER_INDEX", "-1"))
+RAG_ACC_ENABLED = os.getenv("RAG_ACC_ENABLED", "false").lower() != "false"
+
+
+def _split_strict(total: int, workers: int, idx: int) -> int:
+    """将全局配额严格均分给每个 worker。
+
+    使用整除 + 余数策略：前 ``total % workers`` 个 worker 各多分配 1，
+    保证所有 worker 的配额之和严格等于 total。
+
+    Args:
+        total: 全局总配额（如并发上限或队列容量）。
+        workers: worker 总数，若 <= 0 则直接返回 total。
+        idx: 当前 worker 索引（0-based），若不在 [0, workers) 范围内则返回 base 值。
+
+    Returns:
+        int: 当前 worker 分配到的本地配额。
+    """
+    if workers <= 0:
+        return total
+    base = total // workers
+    extra = total % workers
+    if 0 <= idx < workers:
+        return base + (1 if idx < extra else 0)
+    return base
+
+
+# ---------------------------------------------------------------------------
+# 排队和并发控制参数
+#
+# 设计思路：
+#   - 全局配额（GLOBAL_*）用于描述整个 Pod/容器级别的并发上限和队列容量。
+#   - 本地配额（LOCAL_*）通过 _split_strict() 将全局配额均分给每个 worker，
+#     避免多 worker 进程之间超发。
+#   - 双闸门模型（Gate-0 / Gate-1）用于分层流控：
+#       Gate-0: 零等待的快速通道（容量 = GATE0_LOCAL_CAP）
+#       Gate-1: 弹性缓冲通道（容量 = LOCAL_PASS_THROUGH_LIMIT - GATE0_LOCAL_CAP）
+# ---------------------------------------------------------------------------
+LOCAL_PASS_THROUGH_LIMIT = _split_strict(GLOBAL_PASS_THROUGH_LIMIT, WORKERS, WORKER_INDEX)
+LOCAL_QUEUE_MAXSIZE = _split_strict(GLOBAL_QUEUE_MAXSIZE, WORKERS, WORKER_INDEX)
+MAX_INFLIGHT = LOCAL_PASS_THROUGH_LIMIT
+QUEUE_MAXSIZE = LOCAL_QUEUE_MAXSIZE
+QUEUE_TIMEOUT = float(os.getenv("QUEUE_TIMEOUT", "15.0"))
+
+QUEUE_REJECT_POLICY = os.getenv("QUEUE_REJECT_POLICY", "drop_oldest").lower()
+QUEUE_OVERFLOW_MODE = os.getenv("QUEUE_OVERFLOW_MODE", "block").lower()
+
+GATE0_TOTAL = WORKERS
+GATE0_LOCAL_CAP = _split_strict(GATE0_TOTAL, WORKERS, WORKER_INDEX)
+GATE1_LOCAL_CAP = max(0, LOCAL_PASS_THROUGH_LIMIT - GATE0_LOCAL_CAP)
+
+USE_GLOBAL_GATE = os.getenv("USE_GLOBAL_GATE", "false").lower() == "true"
+GATE_SOCK = os.getenv("GATE_SOCK", "")
+
+
+def log_boot_plan():
+    """在服务启动时输出当前生效的代理运行时配置摘要。
+
+    输出内容包括：后端地址、worker 布局、全局/本地并发参数、
+    闸门容量、HTTP/2 状态、重试策略及超时配置。
+    供运维人员在日志中快速确认配置是否符合预期。
+    """
+    logger.info(
+        "Plan: WORKERS=%s INDEX=%s | GLOBAL(inflight=%s, queue=%s) -> LOCAL(inflight=%s, queue=%s) | "
+        "GATE0_TOTAL=%s -> G0_LOCAL=%s, G1_LOCAL=%s | HTTP2=%s H2_MAX_STREAMS=%s | "
+        "RETRY_TRIES=%s INTERVAL=%sms | CONNECT=%ss POOL=%ss",
+        WORKERS,
+        WORKER_INDEX,
+        GLOBAL_PASS_THROUGH_LIMIT,
+        GLOBAL_QUEUE_MAXSIZE,
+        LOCAL_PASS_THROUGH_LIMIT,
+        LOCAL_QUEUE_MAXSIZE,
+        GATE0_TOTAL,
+        GATE0_LOCAL_CAP,
+        GATE1_LOCAL_CAP,
+        HTTP2_ENABLED,
+        H2_MAX_STREAMS,
+        RETRY_TRIES,
+        RETRY_INTERVAL_MS,
+        HTTPX_CONNECT_TIMEOUT,
+        HTTPX_POOL_TIMEOUT,
+    )

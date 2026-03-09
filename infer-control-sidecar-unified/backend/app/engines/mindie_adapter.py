@@ -147,7 +147,24 @@ def _build_env_commands(params: Dict[str, Any]) -> List[str]:
             "&& source /usr/local/Ascend/mindie/set_env.sh "
             "|| echo 'WARN: mindie/set_env.sh not found'"
         )
+        # Additional env scripts required by MindIE (per official boot.sh)
+        cmds.append(
+            "[ -f /usr/local/Ascend/atb-models/set_env.sh ] "
+            "&& source /usr/local/Ascend/atb-models/set_env.sh "
+            "|| echo 'WARN: atb-models/set_env.sh not found'"
+        )
+        cmds.append(
+            "[ -f /usr/local/Ascend/nnal/atb/set_env.sh ] "
+            "&& source /usr/local/Ascend/nnal/atb/set_env.sh "
+            "|| echo 'WARN: nnal/atb/set_env.sh not found'"
+        )
         cmds.append("set -u")
+        # Driver library paths required for NPU device access
+        cmds.append(
+            "export LD_LIBRARY_PATH=\"/usr/local/Ascend/driver/lib64/driver"
+            ":/usr/local/Ascend/driver/lib64/common:${LD_LIBRARY_PATH:-}\""
+        )
+        cmds.append("export GRPC_POLL_STRATEGY=poll")
 
     npu_memory_fraction = (params.get("engine_config") or {}).get("npu_memory_fraction")
     if npu_memory_fraction is not None:
@@ -595,9 +612,17 @@ print('[mindie] config.json merge-updated successfully')
 print(json.dumps(config, indent=2, ensure_ascii=False))
 MERGE_SCRIPT_EOF
 
-# ── Start MindIE daemon ─────────────────────────────────────────────────────
+# ── Start MindIE daemon (background + wait, per official boot.sh) ────────────
 cd '{MINDIE_WORK_DIR}'
-exec ./bin/mindieservice_daemon
+./bin/mindieservice_daemon &
+MINDIE_PID=$!
+echo "[mindie] Daemon started as PID $MINDIE_PID"
+wait $MINDIE_PID
+exit_code=$?
+if [ $exit_code -ne 0 ]; then
+    echo "[mindie] ERROR: daemon exited with code $exit_code"
+fi
+exit $exit_code
 """
     return script
 

@@ -1,0 +1,20 @@
+# =============================================================================
+# Service: 暴露 Proxy 和 Health 端口
+# 端口说明:
+#   - 18000 (proxy):  OpenAI 兼容 API 代理
+#   - 19000 (health): 健康检查端点（K8s Probe 调用）
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-api
+spec:
+  selector:
+    app.kubernetes.io/name: infer-vllm
+  ports:
+    - name: proxy
+      port: 18000
+      targetPort: 18000
+    - name: health
+      port: 19000
+      targetPort: 19000

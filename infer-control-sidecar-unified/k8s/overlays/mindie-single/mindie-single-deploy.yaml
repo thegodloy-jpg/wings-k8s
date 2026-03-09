@@ -1,0 +1,181 @@
+# mindie single-node deployment - customized for .110/.170 ST test
+# Namespace (reuse wings-infer) + Service + Deployment
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mindie-api
+  namespace: wings-infer
+  labels:
+    app.kubernetes.io/name: infer-mindie
+spec:
+  selector:
+    app.kubernetes.io/name: infer-mindie
+  ports:
+    - name: proxy
+      port: 18000
+      targetPort: 18000
+    - name: health
+      port: 19000
+      targetPort: 19000
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infer-mindie
+  namespace: wings-infer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infer-mindie
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infer-mindie
+    spec:
+      # Deploy on .170 (root) since .110 CephFS is blocked
+      nodeSelector:
+        kubernetes.io/hostname: "root"
+
+      tolerations:
+        - key: node.kubernetes.io/disk-pressure
+          operator: Exists
+          effect: NoSchedule
+
+      volumes:
+        - name: shared-volume
+          emptyDir: {}
+        - name: model-volume
+          hostPath:
+            path: /mnt/cephfs/models
+            type: DirectoryOrCreate
+        - name: davinci0
+          hostPath:
+            path: /dev/davinci0
+            type: CharDevice
+        - name: davinci-manager
+          hostPath:
+            path: /dev/davinci_manager
+            type: CharDevice
+        - name: hisi-hdc
+          hostPath:
+            path: /dev/hisi_hdc
+        - name: ascend-driver
+          hostPath:
+            path: /usr/local/Ascend/driver
+            type: Directory
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
+        - name: npu-smi
+          hostPath:
+            path: /usr/local/sbin/npu-smi
+            type: File
+
+      containers:
+        # ---------- wings-infer sidecar ----------
+        - name: wings-infer
+          image: wings-infer:zhanghui-ascend-st-unified
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 18000
+              name: proxy
+            - containerPort: 19000
+              name: health
+          env:
+            - name: WINGS_DEVICE
+              value: "ascend"
+            - name: DEVICE
+              value: "ascend"
+            - name: DEVICE_COUNT
+              value: "1"
+            - name: ENGINE
+              value: "mindie"
+            - name: MODEL_NAME
+              value: "DeepSeek-R1-Distill-Qwen-1.5B"
+            - name: MODEL_PATH
+              value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
+            - name: PORT
+              value: "18000"
+            - name: HEALTH_PORT
+              value: "19000"
+            - name: WINGS_SKIP_PID_CHECK
+              value: "true"
+            - name: BACKEND_URL
+              value: "http://127.0.0.1:17000"
+          volumeMounts:
+            - name: shared-volume
+              mountPath: /shared-volume
+            - name: model-volume
+              mountPath: /models
+              readOnly: true
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 19000
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            failureThreshold: 72
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 19000
+            initialDelaySeconds: 240
+            periodSeconds: 30
+            failureThreshold: 5
+
+        # ---------- mindie engine ----------
+        - name: engine
+          image: mindie:2.2.RC1
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "[engine] Waiting for start_command.sh..."
+              while [ ! -f /shared-volume/start_command.sh ]; do sleep 2; done
+              echo "[engine] Executing..."
+              cd /shared-volume && bash start_command.sh
+          env:
+            - name: ASCEND_VISIBLE_DEVICES
+              value: "0"
+            - name: PATH
+              value: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          volumeMounts:
+            - name: shared-volume
+              mountPath: /shared-volume
+            - name: model-volume
+              mountPath: /models
+              readOnly: true
+            - name: davinci0
+              mountPath: /dev/davinci0
+            - name: davinci-manager
+              mountPath: /dev/davinci_manager
+            - name: hisi-hdc
+              mountPath: /dev/hisi_hdc
+            - name: ascend-driver
+              mountPath: /usr/local/Ascend/driver
+              readOnly: true
+            - name: dshm
+              mountPath: /dev/shm
+            - name: npu-smi
+              mountPath: /usr/local/sbin/npu-smi
+              readOnly: true
+          resources:
+            requests:
+              cpu: "4"
+              memory: "16Gi"
+            limits:
+              cpu: "16"
+              memory: "48Gi"

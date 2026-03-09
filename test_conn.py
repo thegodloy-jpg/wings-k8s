@@ -1,0 +1,11 @@
+import socket
+s = socket.socket()
+s.settimeout(3)
+r = s.connect_ex(("7.6.52.148", 20000))
+print("7.6.52.148:20000 =", r, "( 0=connected, 111=refused, 110=timeout)")
+s.close()
+s2 = socket.socket()
+s2.settimeout(3)
+r2 = s2.connect_ex(("172.17.0.3", 20000))
+print("172.17.0.3:20000 =", r2, "( 0=connected, 111=refused, 110=timeout)")
+s2.close()
