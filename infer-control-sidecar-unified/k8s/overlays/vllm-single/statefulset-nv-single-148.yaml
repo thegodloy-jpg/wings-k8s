@@ -47,7 +47,7 @@ spec:
           type: Directory
       containers:
       - name: wings-infer
-        image: wings-infer:dist-nv-dev-zhanghui
+        image: wings-infer:unified-zhanghui
         imagePullPolicy: IfNotPresent
         env:
         - name: ENGINE
@@ -66,6 +66,8 @@ spec:
           value: "1"
         - name: WINGS_SKIP_PID_CHECK
           value: "true"
+        - name: BACKEND_URL
+          value: "http://127.0.0.1:17000"
         volumeMounts:
         - name: shared-volume
           mountPath: /shared-volume
