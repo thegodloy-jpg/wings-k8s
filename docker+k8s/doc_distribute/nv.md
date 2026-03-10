@@ -484,3 +484,27 @@ Server: ✅ "The server is fired up and ready to roll!" Uvicorn on :17000
 ```
 
 YAML: `deployment-sglang-nv-verify.yaml`（含 nvidia-smi shell 包装器 workaround）
+
+### vLLM 单机验证（unified sidecar）✅
+
+```
+Pod: infer-0   2/2 Running   节点: a100 (.148)
+引擎: vllm/vllm-openai:v0.13.0   CUDA=1 (L20)   tp=1
+Sidecar: wings-infer:unified-zhanghui (infer-control-sidecar-unified)
+GPU 占用: L20 41479 MiB / 46068 MiB
+
+模型加载: ✅ 19.2s, dtype=bfloat16, 3.35GiB
+Attention: FLASH_ATTN
+torch.compile: ✅ 4.0s (Dynamo bytecode transform) + CUDA graph cache
+Health:   ✅ {"s":1,"p":"ready","backend_ok":true,"backend_code":200}
+/v1/models: ✅ DeepSeek-R1-Distill-Qwen-1.5B max_model_len=5120
+/v1/chat/completions (17000 直连): ✅ "1+1=2" (12 tokens)
+/v1/chat/completions (18000 代理): ✅ "2+2=4" thinking + answer (50 tokens)
+```
+
+关键 env vars:
+- `CUDA_VISIBLE_DEVICES=1` + `CUDA_DEVICE_ORDER=PCI_BUS_ID` — 指定 L20
+- `VLLM_HOST_IP=127.0.0.1` — 解决 k3s-in-Docker 下 c10d hostname 解析 hang
+- `NCCL_SOCKET_IFNAME=lo` / `GLOO_SOCKET_IFNAME=lo` — NCCL 使用 loopback
+
+YAML: `tmp-vllm-single.yaml`（StatefulSet, hostNetwork, privileged engine）

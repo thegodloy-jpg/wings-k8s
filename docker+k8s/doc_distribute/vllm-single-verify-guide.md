@@ -233,18 +233,26 @@ spec:
         imagePullPolicy: IfNotPresent
         securityContext:
           privileged: true
-        command: ["/bin/sh", "-c"]
+        command: ["/bin/bash", "-c"]
         args:
         - |
           echo '[engine] Waiting for start_command.sh...'
           while [ ! -f /shared-volume/start_command.sh ]; do sleep 2; done
           echo '[engine] start_command.sh found, executing:'
           cat /shared-volume/start_command.sh
-          export LD_LIBRARY_PATH=/mnt/nvidia-libs:${LD_LIBRARY_PATH:-}
+          export LD_LIBRARY_PATH="/mnt/nvidia-libs:${LD_LIBRARY_PATH:-}"
           cd /shared-volume && bash start_command.sh
         env:
         - name: CUDA_VISIBLE_DEVICES
           value: "1"
+        - name: CUDA_DEVICE_ORDER
+          value: "PCI_BUS_ID"
+        - name: VLLM_HOST_IP
+          value: "127.0.0.1"
+        - name: NCCL_SOCKET_IFNAME
+          value: "lo"
+        - name: GLOO_SOCKET_IFNAME
+          value: "lo"
         volumeMounts:
         - name: shared-volume
           mountPath: /shared-volume
@@ -377,14 +385,14 @@ docker exec k3s-verify-server-zhanghui kubectl get pods -n wings-infer
 
 | # | 检查项 | 预期结果 | 实际结果 |
 |---|--------|----------|----------|
-| 1 | 镜像构建 | `wings-infer:unified-zhanghui` 构建成功 | |
-| 2 | 镜像导入 k3s | `ctr images list` 可见 | |
-| 3 | Pod 启动 | infer-0 2/2 Running | |
-| 4 | start_command.sh 生成 | 包含 `vllm.entrypoints.openai.api_server` | |
-| 5 | /health 返回 200 | 引擎就绪 | |
-| 6 | /v1/models 正常 | 返回 DeepSeek-R1-Distill-Qwen-1.5B | |
-| 7 | /v1/chat/completions | 返回正确推理结果 | |
-| 8 | proxy 链路 | 18000 → 17000 转发正常 | |
+| 1 | 镜像构建 | `wings-infer:unified-zhanghui` 构建成功 | ✅ 构建成功 |
+| 2 | 镜像导入 k3s | `ctr images list` 可见 | ✅ 已导入 |
+| 3 | Pod 启动 | infer-0 2/2 Running | ✅ 2/2 Running |
+| 4 | start_command.sh 生成 | 包含 `vllm.entrypoints.openai.api_server` | ✅ 正确生成 |
+| 5 | /health 返回 200 | 引擎就绪 | ✅ `{"s":1,"p":"ready","backend_ok":true}` |
+| 6 | /v1/models 正常 | 返回 DeepSeek-R1-Distill-Qwen-1.5B | ✅ max_model_len=5120 |
+| 7 | /v1/chat/completions | 返回正确推理结果 | ✅ "1+1=2", "2+2=4" |
+| 8 | proxy 链路 | 18000 → 17000 转发正常 | ✅ 转发正常 |
 
 ---
 
@@ -398,3 +406,6 @@ docker exec k3s-verify-server-zhanghui kubectl get pods -n wings-infer
 | health 返回 201 | 模型加载中，等待 1-3 分钟 |
 | health 返回 502 | 检查 engine 容器日志 `kubectl logs infer-0 -c engine` |
 | proxy 502 | 确认 BACKEND_URL=http://127.0.0.1:17000 |
+| `export: /shared-volume: bad variable name` | engine 容器需使用 `command: ["/bin/bash", "-c"]` 而非 `/bin/sh`，并给 LD_LIBRARY_PATH 加双引号 |
+| vLLM 使用了错误的 GPU | 必须同时设置 `CUDA_DEVICE_ORDER=PCI_BUS_ID` 和 `CUDA_VISIBLE_DEVICES=1` |
+| c10d hostname hang（进程 0% CPU 挂死） | 设置 `VLLM_HOST_IP=127.0.0.1` + `NCCL_SOCKET_IFNAME=lo` + `GLOO_SOCKET_IFNAME=lo` |
