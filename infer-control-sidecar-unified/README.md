@@ -1,10 +1,11 @@
 # Wings-Infer 统一推理控制 Sidecar — 完整操作指南
 
-> **版本**: v4 (Sidecar 架构)  
+> **版本**: v5 (Sidecar 架构 + 分布式 Master-Worker + Accel 加速)  
 > **兼容性**: 与 wings/wings_start.sh 100% CLI 兼容，编排层零修改可替换  
-> **引擎支持**: vLLM / vLLM-Ascend / SGLang / MindIE  
-> **部署模式**: 单机 / 分布式(Ray/HCCL/nnodes)  
-> **硬件支持**: NVIDIA GPU / Ascend 910B NPU
+> **引擎支持**: vLLM / vLLM-Ascend / SGLang / MindIE / Wings (mmgm)  
+> **部署模式**: 单机 / 分布式(Ray/HCCL/nnodes) / Master-Worker  
+> **硬件支持**: NVIDIA GPU / Ascend 910B NPU  
+> **加速增强**: 可选 Accel 加速包（`wings_engine_patch`）
 
 ---
 
@@ -22,7 +23,7 @@
   - [5.5 场景三：K8s 单机部署 (Kustomize)](#55-场景三k8s-单机部署-kustomize)
   - [5.6 场景四：K8s 分布式部署 (Kustomize)](#56-场景四k8s-分布式部署-kustomize)
 - [六、路线 B：wings-infer 镜像已存在，直接启动服务](#六路线-bwings-infer-镜像已存在直接启动服务)
-  - [6.1 方式一：通过 wings_start.sh 启动（推荐，与原始 wings 完全兼容）](#61-方式一通过-wings_startsh-启动推荐与原始-wings-完全兼容)
+  - [6.1 方式一：通过 wings_start.sh 启动（推荐）](#61-方式一通过-wings_startsh-启动推荐与原始-wings-完全兼容)
   - [6.2 方式二：通过 python -m app.main 启动](#62-方式二通过-python--m-appmain-启动)
   - [6.3 方式三：K8s 部署（镜像已推送到仓库）](#63-方式三k8s-部署镜像已推送到仓库)
 - [七、CLI 参数完整参考](#七cli-参数完整参考)
@@ -30,9 +31,11 @@
 - [九、端口规划](#九端口规划)
 - [十、健康检查](#十健康检查)
 - [十一、各引擎部署场景详解](#十一各引擎部署场景详解)
-- [十二、故障排查](#十二故障排查)
-- [十三、从 wings 迁移](#十三从-wings-迁移)
-- [十四、文档索引](#十四文档索引)
+- [十二、Accel 加速包](#十二accel-加速包)
+- [十三、分布式 Master-Worker 模式](#十三分布式-master-worker-模式)
+- [十四、故障排查](#十四故障排查)
+- [十五、从 wings 迁移](#十五从-wings-迁移)
+- [十六、文档索引](#十六文档索引)
 
 ---
 
@@ -44,6 +47,8 @@ Wings-Infer 是一个统一的推理引擎控制 Sidecar，负责：
 2. **脚本传递** — 将生成的 `start_command.sh` 写入共享卷，引擎容器读取并执行
 3. **代理服务** — 对外暴露统一的 OpenAI 兼容 API（端口 18000）
 4. **健康检查** — 提供 K8s 就绪/存活探针接口（端口 19000）
+5. **分布式协调** — Master-Worker 架构下的节点注册、心跳监控与任务调度
+6. **加速增强** — 可选的 Accel 补丁注入，在引擎启动前安装性能优化包
 
 ---
 
@@ -52,33 +57,39 @@ Wings-Infer 是一个统一的推理引擎控制 Sidecar，负责：
 ### 2.1 Sidecar 双容器架构
 
 ```
-┌─ K8s Pod ──────────────────────────────────────────────────┐
-│                                                             │
-│  ┌─ wings-infer (Sidecar 容器) ──────────────────────┐     │
-│  │                                                    │     │
-│  │  wings_start.sh                                    │     │
-│  │       ↓                                            │     │
-│  │  python -m app.main                                │     │
-│  │       ├── 解析参数 → 生成 start_command.sh ────────┼──┐  │
-│  │       ├── 启动 proxy   (uvicorn :18000)            │  │  │
-│  │       └── 启动 health  (uvicorn :19000)            │  │  │
-│  │                                                    │  │  │
-│  └────────────────────────────────────────────────────┘  │  │
-│                                                          │  │
-│  ┌─ engine (推理引擎容器) ───────────────────────────┐  │  │
-│  │                                                    │  │  │
-│  │  等待 start_command.sh 生成                        │  │  │
-│  │       ↓                                            │  │  │
-│  │  exec bash /shared-volume/start_command.sh  ←──────┘  │  │
-│  │       ↓                                               │  │
-│  │  vllm/sglang/mindie serve :17000                      │  │
-│  │                                                       │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                                                             │
-│  ┌─ 共享卷 /shared-volume/ ─────────────────────────────┐  │
-│  │  start_command.sh   (由 wings-infer 写入)             │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+┌─ K8s Pod ────────────────────────────────────────────────────────┐
+│                                                                   │
+│  (可选) initContainer: accel-init                                 │
+│         wings-accel:latest → cp /accel/* → /accel-volume/         │
+│                                                                   │
+│  ┌─ wings-infer (Sidecar 容器) ────────────────────────────┐     │
+│  │                                                          │     │
+│  │  wings_start.sh                                          │     │
+│  │       ↓                                                  │     │
+│  │  python -m app.main                                      │     │
+│  │       ├── 解析参数 → 生成 start_command.sh ──────────────┼──┐  │
+│  │       ├── 启动 proxy   (uvicorn :18000)                  │  │  │
+│  │       └── 启动 health  (uvicorn :19000)                  │  │  │
+│  │                                                          │  │  │
+│  └──────────────────────────────────────────────────────────┘  │  │
+│                                                                │  │
+│  ┌─ engine (推理引擎容器) ─────────────────────────────────┐  │  │
+│  │                                                          │  │  │
+│  │  等待 start_command.sh 生成                              │  │  │
+│  │       ↓                                                  │  │  │
+│  │  (ENABLE_ACCEL=true → cd /accel-volume && bash install.sh│  │  │
+│  │       ↓                                                  │  │  │
+│  │  exec bash /shared-volume/start_command.sh  ←────────────┘  │  │
+│  │       ↓                                                     │  │
+│  │  vllm/sglang/mindie serve :17000                            │  │
+│  │                                                             │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                   │
+│  ┌─ 共享卷 ──────────────────────────────────────────────────┐   │
+│  │  /shared-volume/start_command.sh  (由 wings-infer 写入)    │   │
+│  │  /accel-volume/*                  (由 accel-init 写入)     │   │
+│  └────────────────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.2 数据流
@@ -92,30 +103,84 @@ Wings-Infer 是一个统一的推理引擎控制 Sidecar，负责：
          ▼
   python -m app.main
          │
-         ├── parse_launch_args()     → LaunchArgs (frozen)
-         ├── derive_port_plan()      → PortPlan (17000/18000/19000)
-         ├── build_launcher_plan()   → LauncherPlan
-         │      ├── config_loader    → 4 层配置合并
-         │      ├── engine_manager   → 适配器选择
-         │      └── adapter          → 生成 bash 脚本
+         ├── _determine_role()       → standalone / master / worker
          │
-         ├── write_start_command()   → /shared-volume/start_command.sh
+         ├── [standalone 模式]
+         │      ├── parse_launch_args()     → LaunchArgs (frozen)
+         │      ├── derive_port_plan()      → PortPlan (17000/18000/19000)
+         │      ├── build_launcher_plan()   → LauncherPlan
+         │      │      ├── detect_hardware  → 硬件探测
+         │      │      ├── config_loader    → 4 层配置合并
+         │      │      ├── engine_manager   → 适配器选择
+         │      │      ├── accel inject     → WINGS_ENGINE_PATCH_OPTIONS
+         │      │      └── adapter          → 生成 bash 脚本
+         │      ├── write_start_command()   → /shared-volume/start_command.sh
+         │      └── spawn 子进程
+         │             ├── proxy  (uvicorn :18000)
+         │             └── health (uvicorn :19000)
          │
-         └── spawn 子进程
-                ├── proxy  (uvicorn :18000)  ← 请求转发到 engine:17000
-                └── health (uvicorn :19000)  ← K8s 探针
+         ├── [master 模式]
+         │      └── MasterService (FastAPI)
+         │             ├── /api/nodes/register   ← Worker 注册
+         │             ├── /api/start_engine      ← 启动引擎
+         │             ├── /api/heartbeat          ← 心跳接收
+         │             └── TaskScheduler           ← 负载调度
+         │
+         └── [worker 模式]
+                └── WorkerService (FastAPI)
+                       ├── 注册到 Master
+                       ├── /api/start_engine  ← 执行脚本生成
+                       └── 心跳上报线程
+```
+
+### 2.3 配置合并（4 层优先级）
+
+```
+优先级从高到低：
+
+  ┌─ 1. CLI 参数 / 环境变量 ─────────────────────┐  最高优先级
+  │   --engine vllm --gpu-memory-utilization 0.95  │
+  └────────────────────────────────────────────────┘
+                       ▼ 覆盖
+  ┌─ 2. 用户配置文件 (--config-file) ─────────────┐
+  │   custom_config.json                           │
+  └────────────────────────────────────────────────┘
+                       ▼ 覆盖
+  ┌─ 3. 模型特定配置 ────────────────────────────┐
+  │   model_deploy_config[<model_name>]            │
+  │   from vllm_default.json / ascend_default.json │
+  └────────────────────────────────────────────────┘
+                       ▼ 覆盖
+  ┌─ 4. 硬件默认配置 ────────────────────────────┐  最低优先级
+  │   vllm_default.json / ascend_default.json      │
+  │   / sglang_default.json / mindie_default.json  │
+  └────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## 三、支持矩阵
 
-| 引擎 | 单机 | 分布式 | 硬件 | K8s Overlay |
-|------|------|--------|------|-------------|
-| **vllm** | ✅ | ✅ (Ray) | NVIDIA GPU | `vllm-single/` / `vllm-distributed/` |
-| **vllm_ascend** | ✅ | ✅ (Ray) | Ascend 910B NPU | `vllm-ascend-single/` / `vllm-ascend-distributed/` |
-| **sglang** | ✅ | ✅ (nnodes) | NVIDIA GPU | `sglang-single/` / `sglang-distributed/` |
-| **mindie** | ✅ | ✅ (HCCL) | Ascend 910B NPU | `mindie-single/` / `mindie-distributed/` |
+| 引擎 | 单机 | 分布式 | 硬件 | K8s Overlay | 备注 |
+|------|------|--------|------|-------------|------|
+| **vllm** | ✅ | ✅ (Ray / DP) | NVIDIA GPU | `vllm-single/` / `vllm-distributed/` | 含 NIXL PD 分离 |
+| **vllm_ascend** | ✅ | ✅ (Ray) | Ascend 910B NPU | `vllm-ascend-single/` / `vllm-ascend-distributed/` | Ascend 设备自动切换 |
+| **sglang** | ✅ | ✅ (nnodes) | NVIDIA GPU | `sglang-single/` / `sglang-distributed/` | 原生 nnodes 分布式 |
+| **mindie** | ✅ | ✅ (HCCL) | Ascend 910B NPU | `mindie-single/` / `mindie-distributed/` | 310 设备专用 |
+| **wings** | ✅ | — | NVIDIA GPU / Ascend | — | mmgm / HunyuanVideo 模型 |
+
+### 引擎自动选择
+
+当用户未指定引擎或使用默认值时，sidecar 会根据以下规则自动选择/升级引擎：
+
+| 条件 | 自动选择结果 |
+|------|-------------|
+| Ascend 设备 + `ENGINE=vllm` | 自动升级为 `vllm_ascend` |
+| Ascend 310 设备 | 使用 `mindie` |
+| `MODEL_TYPE=mmgm` | 使用 `wings` |
+| `MODEL_TYPE=embedding/rerank` + Ascend + mindie | 切换为 `vllm_ascend` |
+| `OPERATOR_ACCELERATION=true` + Ascend + mindie | 切换为 `vllm_ascend` |
+| `LMCACHE=true` + Ascend + mindie | 切换为 `vllm_ascend` |
 
 ---
 
@@ -125,45 +190,100 @@ Wings-Infer 是一个统一的推理引擎控制 Sidecar，负责：
 infer-control-sidecar-unified/
 ├── Dockerfile                    # Sidecar 容器镜像定义
 ├── wings_start.sh                # 兼容 wings 的启动脚本（ENTRYPOINT）
+├── .env.example                  # 环境变量模板
+├── build-accel-image.sh          # Accel 加速镜像构建脚本
 ├── README.md                     # 本文档
+├── BUG_FIX_REPORT.md             # Bug 修复报告
+│
 ├── backend/
 │   ├── requirements.txt          # Python 依赖
 │   └── app/
-│       ├── main.py               # Sidecar 主入口（launcher）
-│       ├── config/               # 配置定义 + 引擎参数映射 JSON
+│       ├── __init__.py
+│       ├── main.py               # Sidecar 主入口（launcher + 角色分发）
+│       │
+│       ├── config/               # 配置定义 + 引擎默认参数
 │       │   ├── settings.py       # 全局配置单例（pydantic-settings）
-│       │   └── *.json            # 引擎默认配置文件
+│       │   ├── vllm_default.json      # vLLM 引擎默认配置（新版统一）
+│       │   ├── sglang_default.json    # SGLang 引擎默认配置
+│       │   ├── mindie_default.json    # MindIE 引擎默认配置
+│       │   ├── nvidia_default.json    # NVIDIA 设备默认配置（旧版兼容）
+│       │   ├── ascend_default.json    # Ascend 设备默认配置（旧版兼容）
+│       │   ├── distributed_config.json     # 分布式端口默认值
+│       │   └── engine_parameter_mapping.json # 引擎参数名映射表
+│       │
 │       ├── core/                 # 核心控制逻辑
-│       │   ├── config_loader.py  # 4 层配置合并（1500+ 行）
-│       │   ├── engine_manager.py # 引擎适配器动态加载
+│       │   ├── config_loader.py  # 4 层配置合并（1500+ 行，核心模块）
+│       │   ├── engine_manager.py # 引擎适配器动态加载（importlib）
 │       │   ├── hardware_detect.py# 硬件探测（环境变量驱动）
-│       │   ├── port_plan.py      # 三层端口规划
-│       │   ├── start_args_compat.py # CLI 兼容层（30 个参数）
-│       │   └── wings_entry.py    # LauncherPlan 构建
-│       ├── engines/              # 引擎适配器
-│       │   ├── vllm_adapter.py   # vLLM + vLLM-Ascend
-│       │   ├── sglang_adapter.py # SGLang
-│       │   └── mindie_adapter.py # MindIE
+│       │   ├── port_plan.py      # 三层端口规划（17000/18000/19000）
+│       │   ├── start_args_compat.py # CLI 兼容层（30+ 参数解析）
+│       │   └── wings_entry.py    # LauncherPlan 构建 + Accel 注入
+│       │
+│       ├── engines/              # 引擎适配器（生成 bash 启动脚本）
+│       │   ├── vllm_adapter.py   # vLLM + vLLM-Ascend（698 行）
+│       │   ├── sglang_adapter.py # SGLang（235 行）
+│       │   └── mindie_adapter.py # MindIE（650 行）
+│       │
+│       ├── distributed/          # 分布式 Master-Worker 模块
+│       │   ├── master.py         # Master 节点（FastAPI，节点注册/引擎启动）
+│       │   ├── worker.py         # Worker 节点（FastAPI，脚本生成/心跳）
+│       │   ├── monitor.py        # 节点健康监控（心跳检测/节点移除）
+│       │   └── scheduler.py      # 任务调度器（least_load/round_robin/random）
+│       │
 │       ├── proxy/                # 反向代理 + 健康检查
-│       │   ├── gateway.py        # FastAPI 代理（流式/非流式）
+│       │   ├── gateway.py        # FastAPI 代理（流式/非流式转发）
 │       │   ├── health.py         # 健康状态机（7 阶段）
 │       │   ├── health_service.py # 健康 FastAPI 应用
 │       │   ├── settings.py       # 代理配置（连接池/重试/超时）
 │       │   ├── simple_proxy.py   # 低层 HTTP 转发
-│       │   └── ...
+│       │   ├── queueing.py       # 双门 FIFO 队列控制器
+│       │   ├── http_client.py    # HTTP 客户端封装
+│       │   ├── speaker_logging.py# 请求日志
+│       │   └── tags.py           # 请求标签
+│       │
 │       └── utils/                # 工具模块
+│           ├── env_utils.py      # 环境变量解析（382 行）
+│           ├── file_utils.py     # 文件读写工具（safe_write_file 等）
+│           ├── device_utils.py   # 设备探测（NVIDIA/Ascend/CPU）
+│           ├── model_utils.py    # 模型元数据解析（ModelIdentifier）
+│           ├── noise_filter.py   # 日志噪声过滤
+│           └── process_utils.py  # 进程管理（PID/流转发）
+│
 ├── k8s/
-│   ├── base/                     # Kustomize base
+│   ├── base/                     # Kustomize base（公共定义）
 │   └── overlays/                 # 8 个部署场景
-│       ├── vllm-single/          # vLLM 单机 (NV GPU)
-│       ├── vllm-distributed/     # vLLM + Ray 分布式 (NV GPU)
+│       ├── vllm-single/          # vLLM 单机 (NVIDIA GPU)
+│       ├── vllm-distributed/     # vLLM + Ray 分布式 (NVIDIA GPU)
 │       ├── vllm-ascend-single/   # vLLM-Ascend 单机 (Ascend NPU)
 │       ├── vllm-ascend-distributed/ # vLLM-Ascend + Ray 分布式 (Ascend NPU)
-│       ├── sglang-single/        # SGLang 单机 (NV GPU)
-│       ├── sglang-distributed/   # SGLang 分布式 (NV GPU)
+│       ├── sglang-single/        # SGLang 单机 (NVIDIA GPU)
+│       ├── sglang-distributed/   # SGLang 分布式 (NVIDIA GPU)
 │       ├── mindie-single/        # MindIE 单机 (Ascend NPU)
 │       └── mindie-distributed/   # MindIE + HCCL 分布式 (Ascend NPU)
-└── doc/                          # 详细文档
+│
+├── wings-accel/                  # Accel 加速包（可选组件）
+│   ├── Dockerfile                # Alpine 镜像定义
+│   ├── install.sh                # 入口安装脚本
+│   ├── supported_features.json   # 引擎兼容性矩阵
+│   └── wings_engine_patch/       # 补丁包
+│       ├── install.sh            # pip install *.whl
+│       └── *.whl                 # Python 补丁包
+│
+├── doc/                          # 详细文档
+│   ├── QUICKSTART.md             # 快速上手
+│   ├── architecture.md           # 架构详解
+│   ├── troubleshooting.md        # 故障排查
+│   ├── deploy-vllm.md            # vLLM 部署
+│   ├── deploy-vllm-ascend.md     # vLLM-Ascend 部署
+│   ├── deploy-vllm-ascend-dist-ray.md # vLLM-Ascend 分布式
+│   ├── deploy-sglang.md          # SGLang 部署
+│   ├── deploy-mindie.md          # MindIE 部署
+│   ├── deploy-accel.md           # Accel 加速部署
+│   ├── version-diff-report.md    # 版本差异报告
+│   ├── security-audit-fix-report.md # 安全审计报告
+│   └── code-cleanup-log.md       # 代码清理记录
+│
+└── test_doc/                     # 测试文档
 ```
 
 ---
@@ -186,8 +306,12 @@ infer-control-sidecar-unified/
 # 进入项目根目录
 cd infer-control-sidecar-unified/
 
-# 构建镜像
+# 构建 Sidecar 镜像
 docker build -t wings-infer:latest .
+
+# （可选）构建 Accel 加速镜像
+bash build-accel-image.sh           # 默认 tag: latest
+bash build-accel-image.sh v1.0.0    # 自定义 tag
 
 # 验证构建结果
 docker run --rm wings-infer:latest --help
@@ -252,12 +376,7 @@ services:
 
   engine:
     image: vllm/vllm-openai:latest
-    runtime: nvidia                    # NVIDIA GPU
-    # deploy:                          # 或使用 deploy 限定 GPU
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - capabilities: [gpu]
+    runtime: nvidia
     command: >
       /bin/sh -c "while [ ! -f /shared-volume/start_command.sh ]; do sleep 2; done;
       cd /shared-volume && bash start_command.sh"
@@ -265,7 +384,7 @@ services:
       - shared-vol:/shared-volume
       - /path/to/models:/models:ro
     ports:
-      - "17000:17000"                 # 引擎端口（可选暴露）
+      - "17000:17000"
 
 volumes:
   shared-vol:
@@ -274,12 +393,8 @@ volumes:
 启动：
 
 ```bash
-# 启动全部服务
 docker compose up -d
-
-# 查看日志
 docker compose logs -f wings-infer
-docker compose logs -f engine
 
 # 健康检查
 curl http://localhost:19000/health
@@ -292,9 +407,6 @@ curl http://localhost:18000/v1/chat/completions \
     "messages": [{"role": "user", "content": "你好"}],
     "max_tokens": 100
   }'
-
-# 停止
-docker compose down
 ```
 
 **Ascend NPU 适配**（替换 engine 容器配置）:
@@ -352,7 +464,6 @@ kubectl -n wings-infer get pods -w
 
 # 6. 验证
 kubectl -n wings-infer port-forward deploy/infer 18000:18000 19000:19000
-
 curl http://localhost:19000/health
 curl http://localhost:18000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -467,17 +578,8 @@ docker run --rm -it \
 #### 直接在容器内执行
 
 ```bash
-# 进入已运行的容器
 docker exec -it <container_id> bash
-
-# 使用 wings_start.sh
 bash /app/wings_start.sh --model-name test-model --model-path /weights
-
-# 使用环境变量（与 wings_start.sh 等效）
-export MODEL_NAME=test-model
-export MODEL_PATH=/weights
-export ENGINE=vllm
-bash /app/wings_start.sh --model-name $MODEL_NAME --model-path $MODEL_PATH
 ```
 
 #### K8s Pod 中使用（与 wings 完全相同）
@@ -493,7 +595,6 @@ spec:
       containers:
         - name: wings-infer
           image: wings-infer:latest
-          # args 直接传给 wings_start.sh（ENTRYPOINT）
           args:
             - "--model-name"
             - "DeepSeek-R1"
@@ -510,9 +611,8 @@ spec:
 
 > 跳过 wings_start.sh，直接调用 Python 入口。适用于开发调试或自定义入口场景。
 
-#### Docker 运行（覆盖 ENTRYPOINT）
-
 ```bash
+# Docker（覆盖 ENTRYPOINT）
 docker run --rm -it \
   --entrypoint python \
   -p 18000:18000 -p 19000:19000 \
@@ -521,56 +621,29 @@ docker run --rm -it \
   -m app.main \
   --model-name test-model \
   --model-path /weights
-```
 
-#### 本地开发运行（不使用 Docker）
-
-```bash
-# 1. 安装依赖
+# 本地开发（不使用 Docker）
 cd infer-control-sidecar-unified/backend
 pip install -r requirements.txt
 
-# 2. 设置环境变量
 export PYTHONPATH=$(pwd)
 export WINGS_SKIP_PID_CHECK=true
 export SHARED_VOLUME_PATH=/tmp/shared-volume
 mkdir -p $SHARED_VOLUME_PATH
 
-# 3. 运行
 python -m app.main \
   --model-name test-model \
   --model-path /weights \
   --engine vllm
 
-# 4. 查看生成的启动脚本
+# 查看生成的启动脚本
 cat /tmp/shared-volume/start_command.sh
-
-# 5. 检查健康状态
-curl http://localhost:19000/health
-
-# 6. 代理将转发到 127.0.0.1:17000（引擎端口）
-# 如果没有真实引擎运行，代理会返回 502
-curl http://localhost:18000/v1/models
-```
-
-#### 容器内直接运行
-
-```bash
-docker exec -it <container_id> bash
-
-# 确保 PYTHONPATH 正确
-export PYTHONPATH=/app
-python -m app.main --model-name test-model --model-path /weights
 ```
 
 ### 6.3 方式三：K8s 部署（镜像已推送到仓库）
 
 ```bash
-# 镜像已存在于仓库中，直接部署
-
 # 方式 A: 使用 Kustomize overlay
-vim k8s/overlays/vllm-single/deployment.yaml
-# 修改 image: your-registry/wings-infer:your-tag
 kubectl apply -k k8s/overlays/vllm-single/
 
 # 方式 B: 快速创建 Pod（临时测试）
@@ -592,7 +665,7 @@ kubectl set image deployment/infer \
 
 ## 七、CLI 参数完整参考
 
-以下 30 个参数与 wings/wings_start.sh 完全一致：
+以下 30+ 参数与 wings/wings_start.sh 完全一致：
 
 | 参数 | 类型 | 默认值 | 环境变量 | 说明 |
 |------|------|--------|----------|------|
@@ -600,14 +673,14 @@ kubectl set image deployment/infer \
 | `--port` | int | `18000` | `PORT` | 监听端口（代理模式下为后端端口 17000） |
 | `--model-name` | string | **必填** | `MODEL_NAME` | 模型名称 |
 | `--model-path` | string | `/weights` | `MODEL_PATH` | 模型文件路径 |
-| `--engine` | string | `vllm` | `ENGINE` | 引擎类型: vllm/vllm_ascend/sglang/mindie |
+| `--engine` | string | `vllm` | `ENGINE` | 引擎: vllm/vllm_ascend/sglang/mindie/wings |
 | `--input-length` | int | `4096` | `INPUT_LENGTH` | 最大输入长度 |
 | `--output-length` | int | `1024` | `OUTPUT_LENGTH` | 最大输出长度 |
 | `--config-file` | string | `""` | `CONFIG_FILE` | 自定义配置文件路径 |
 | `--gpu-usage-mode` | string | `full` | `GPU_USAGE_MODE` | GPU 使用模式 |
 | `--device-count` | int | `1` | `DEVICE_COUNT` | 设备数量 |
 | `--model-type` | string | `auto` | `MODEL_TYPE` | 模型类型: auto/llm/embedding/rerank/mmum/mmgm |
-| `--save-path` | string | `/opt/wings/outputs` | `SAVE_PATH` | 输出目录 |
+| `--save-path` | string | `/opt/wings/outputs` | `SAVE_PATH` | 输出目录（mmgm/wings 使用） |
 | `--trust-remote-code` | bool | `true` | `TRUST_REMOTE_CODE` | 信任远程代码 |
 | `--dtype` | string | `auto` | `DTYPE` | 数据类型 |
 | `--kv-cache-dtype` | string | `auto` | `KV_CACHE_DTYPE` | KV 缓存数据类型 |
@@ -637,7 +710,7 @@ kubectl set image deployment/infer \
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `ENGINE` | `vllm` | 引擎类型 |
+| `ENGINE` | `vllm` | 引擎类型: vllm/vllm_ascend/sglang/mindie/wings |
 | `MODEL_NAME` | — | 模型名称（必填） |
 | `MODEL_PATH` | `/weights` | 模型路径 |
 | `ENGINE_PORT` | `17000` | 引擎真实监听端口 |
@@ -658,28 +731,37 @@ kubectl set image deployment/infer \
 
 ### 分布式配置
 
-| 变量 | 说明 |
-|------|------|
-| `DISTRIBUTED` | 是否分布式 (`true`/`false`) |
-| `NNODES` | 节点总数 |
-| `NODE_RANK` | 当前节点序号 |
-| `HEAD_NODE_ADDR` | Head 节点 IP |
-| `NODE_IPS` | 所有节点 IP（逗号分隔） |
-| `MASTER_ADDR` | Master 地址（部分引擎使用） |
-| `MASTER_PORT` | Master 端口 |
-| `DISTRIBUTED_EXECUTOR_BACKEND` | 分布式后端 (`ray`/`mp`) |
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `DISTRIBUTED` | `false` | 是否分布式 |
+| `NNODES` | `1` | 节点总数 |
+| `NODE_RANK` | `0` | 当前节点序号 |
+| `HEAD_NODE_ADDR` | `127.0.0.1` | Head 节点 IP |
+| `NODE_IPS` | — | 所有节点 IP（逗号分隔） |
+| `MASTER_IP` | — | Master 节点 IP（Master-Worker 模式） |
+| `MASTER_ADDR` | — | Master 地址（部分引擎使用） |
+| `MASTER_PORT` | — | Master 端口 |
+| `DISTRIBUTED_EXECUTOR_BACKEND` | `ray` | 分布式后端: ray/mp |
 
 ### 硬件配置
 
-| 变量 | 说明 |
-|------|------|
-| `WINGS_DEVICE` | 硬件类型: `nvidia`/`ascend` |
-| `WINGS_DEVICE_COUNT` | 设备数量 |
-| `WINGS_DEVICE_NAME` | 设备名称 |
-| `ASCEND_VISIBLE_DEVICES` | Ascend NPU 设备号 |
-| `NVIDIA_VISIBLE_DEVICES` | NVIDIA GPU 设备号 |
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `WINGS_DEVICE` | `nvidia` | 硬件类型: nvidia/ascend |
+| `WINGS_DEVICE_COUNT` | — | 设备数量 |
+| `WINGS_DEVICE_NAME` | — | 设备名称 |
+| `WINGS_DEVICE_MEMORY` | — | 设备显存 (GB，用于 cuda_graph_sizes 计算) |
+| `ASCEND_VISIBLE_DEVICES` | — | Ascend NPU 设备号 |
+| `NVIDIA_VISIBLE_DEVICES` | — | NVIDIA GPU 设备号 |
 
-### 代理调优（可选，已对齐 wings 默认值）
+### Accel 加速
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `ENABLE_ACCEL` | `false` | 是否启用 Accel 加速补丁注入 |
+| `WINGS_ENGINE_PATCH_OPTIONS` | — | 手动指定补丁选项 (JSON)，覆盖自动生成 |
+
+### 代理调优
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
@@ -690,6 +772,18 @@ kubectl set image deployment/infer \
 | `RETRY_TRIES` | `3` | 重试次数（含首次） |
 | `RETRY_INTERVAL_MS` | `100` | 重试间隔（毫秒） |
 | `QUEUE_TIMEOUT` | `15.0` | 队列等待超时（秒） |
+
+### 日志噪声过滤
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `NOISE_FILTER_DISABLE` | `0` | 完全禁用所有过滤 |
+| `HEALTH_FILTER_ENABLE` | `1` | /health 日志过滤 |
+| `BATCH_NOISE_FILTER_ENABLE` | `1` | Prefill/Decode 噪声过滤 |
+| `PYNVML_FILTER_ENABLE` | `1` | pynvml 警告过滤 |
+| `STDIO_FILTER_ENABLE` | `1` | stdout/stderr 过滤 |
+
+完整环境变量模板参见 [.env.example](.env.example)
 
 ---
 
@@ -719,6 +813,16 @@ kubectl set image deployment/infer \
 | `18000` | Wings 代理端口 | NodePort / LoadBalancer |
 | `19000` | 健康检查端口 | K8s 探针 |
 
+**分布式端口**（按引擎自动分配）：
+
+| 端口 | 引擎 | 用途 |
+|------|------|------|
+| `6379` | vLLM | Ray 头节点 |
+| `28030` | SGLang | 分布式初始化 |
+| `13355` | vLLM DP | RPC 通信 |
+| `27070` | MindIE | HCCL Master |
+| `5759` | vLLM PD | NIXL KV 传输 |
+
 当 `ENABLE_REASON_PROXY=false` 时，不启动代理，引擎直接监听 `--port` 指定的端口。
 
 ---
@@ -728,11 +832,8 @@ kubectl set image deployment/infer \
 ### 端点
 
 ```bash
-# 健康状态
-curl http://<host>:19000/health
-
-# 详细状态（JSON）
-curl http://<host>:19000/health/detail
+curl http://<host>:19000/health         # 健康状态
+curl http://<host>:19000/health/detail  # 详细状态（JSON）
 ```
 
 ### 状态码
@@ -751,7 +852,7 @@ readinessProbe:
   httpGet:
     path: /health
     port: 19000
-  initialDelaySeconds: 60      # 引擎启动可能需要 1-5 分钟
+  initialDelaySeconds: 60
   periodSeconds: 10
   failureThreshold: 36         # 允许 6 分钟启动窗口
 livenessProbe:
@@ -770,7 +871,6 @@ livenessProbe:
 ### 11.1 vLLM (NVIDIA GPU)
 
 ```bash
-# 单机
 docker run --runtime nvidia \
   -p 18000:18000 -p 19000:19000 \
   -v /models:/models:ro \
@@ -799,6 +899,8 @@ docker run \
 # K8s
 kubectl apply -k k8s/overlays/vllm-ascend-single/
 ```
+
+> **提示**: 在 Ascend 设备上使用 `--engine vllm` 时，sidecar 会自动升级为 `vllm_ascend`。
 
 详细文档：[doc/deploy-vllm-ascend.md](doc/deploy-vllm-ascend.md)
 
@@ -842,9 +944,9 @@ kubectl apply -k k8s/overlays/mindie-single/
 ```bash
 # 必需环境变量
 export DISTRIBUTED=true
-export NNODES=2                              # 节点总数
-export HEAD_NODE_ADDR=192.168.1.100          # rank-0 IP
-export NODE_IPS=192.168.1.100,192.168.1.101  # 所有节点 IP
+export NNODES=2
+export HEAD_NODE_ADDR=192.168.1.100
+export NODE_IPS=192.168.1.100,192.168.1.101
 
 # rank-0 节点
 docker run --network host \
@@ -867,18 +969,142 @@ docker run --network host \
   --model-name DeepSeek-R1 --model-path /models/DeepSeek-R1 --distributed
 ```
 
-K8s 分布式 overlay 请参考：
+K8s 分布式 overlay：
 
-| 引擎 | K8s Overlay | 详细文档 |
-|------|------------|----------|
-| vLLM (Ray) | `kubectl apply -k k8s/overlays/vllm-distributed/` | [doc/deploy-vllm.md](doc/deploy-vllm.md) |
-| vLLM-Ascend (Ray) | `kubectl apply -k k8s/overlays/vllm-ascend-distributed/` | [doc/deploy-vllm-ascend-dist-ray.md](doc/deploy-vllm-ascend-dist-ray.md) |
-| SGLang (nnodes) | `kubectl apply -k k8s/overlays/sglang-distributed/` | [doc/deploy-sglang.md](doc/deploy-sglang.md) |
-| MindIE (HCCL) | `kubectl apply -k k8s/overlays/mindie-distributed/` | [doc/deploy-mindie.md](doc/deploy-mindie.md) |
+| 引擎 | 命令 | 文档 |
+|------|------|------|
+| vLLM (Ray) | `kubectl apply -k k8s/overlays/vllm-distributed/` | [deploy-vllm.md](doc/deploy-vllm.md) |
+| vLLM-Ascend (Ray) | `kubectl apply -k k8s/overlays/vllm-ascend-distributed/` | [deploy-vllm-ascend-dist-ray.md](doc/deploy-vllm-ascend-dist-ray.md) |
+| SGLang (nnodes) | `kubectl apply -k k8s/overlays/sglang-distributed/` | [deploy-sglang.md](doc/deploy-sglang.md) |
+| MindIE (HCCL) | `kubectl apply -k k8s/overlays/mindie-distributed/` | [deploy-mindie.md](doc/deploy-mindie.md) |
 
 ---
 
-## 十二、故障排查
+## 十二、Accel 加速包
+
+### 12.1 概述
+
+Wings-Accel 是一个**可选的加速增强组件**，通过 K8s initContainer 模式将 `wings_engine_patch` Python 包注入到推理引擎容器中。
+
+### 12.2 工作原理
+
+```
+┌─── K8s Pod ──────────────────────────────────────────────────────┐
+│                                                                   │
+│  [1] initContainer: accel-init (wings-accel:latest)               │
+│       → cp -r /accel/* → /accel-volume/                           │
+│                                                                   │
+│  [2] wings-infer (sidecar, ENABLE_ACCEL=true)                     │
+│       → 向 start_command.sh 注入:                                 │
+│         export WINGS_ENGINE_PATCH_OPTIONS='{"vllm":["test_patch"]}'│
+│                                                                   │
+│  [3] engine 容器                                                  │
+│       → cd /accel-volume && bash install.sh                       │
+│       → 执行 start_command.sh (含 PATCH_OPTIONS)                  │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### 12.3 构建与部署
+
+```bash
+# 构建 Accel 镜像
+bash build-accel-image.sh              # tag: latest
+bash build-accel-image.sh v1.0.0       # 自定义 tag
+
+# K8s 启用（在 StatefulSet/Deployment 中添加）
+env:
+  - name: ENABLE_ACCEL
+    value: "true"
+```
+
+### 12.4 补丁选项
+
+Accel 会根据引擎类型自动生成 `WINGS_ENGINE_PATCH_OPTIONS`：
+
+| 引擎 | 默认选项 |
+|------|---------|
+| vllm / vllm_ascend | `{"vllm": ["test_patch"]}` |
+| sglang | `{"sglang": ["test_patch"]}` |
+| mindie | `{"mindie": ["test_patch"]}` |
+
+也可通过环境变量手动覆盖：
+
+```bash
+export WINGS_ENGINE_PATCH_OPTIONS='{"vllm": ["custom_feature_1", "custom_feature_2"]}'
+```
+
+详细文档：[doc/deploy-accel.md](doc/deploy-accel.md)
+
+---
+
+## 十三、分布式 Master-Worker 模式
+
+### 13.1 概述
+
+除了传统的 K8s StatefulSet 分布式模式，sidecar 还支持 Master-Worker 架构，由 `main.py` 根据环境变量自动判断角色。
+
+### 13.2 角色判定
+
+```python
+# main.py → _determine_role()
+if settings.DISTRIBUTED and settings.MASTER_IP:
+    local_ip = get_local_ip()
+    if local_ip == settings.MASTER_IP:
+        return "master"
+    else:
+        return "worker"
+else:
+    return "standalone"
+```
+
+| 条件 | 角色 | 行为 |
+|------|------|------|
+| `DISTRIBUTED=false` | standalone | 直接生成脚本 + 启动 proxy/health |
+| `DISTRIBUTED=true` + `MASTER_IP=本机IP` | master | 启动 Master API，等待 Worker 注册 |
+| `DISTRIBUTED=true` + `MASTER_IP≠本机IP` | worker | 注册到 Master，等待启动指令 |
+
+### 13.3 Master 节点 API
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/nodes/register` | POST | Worker 注册 |
+| `/api/nodes` | GET | 查询所有活跃节点 |
+| `/api/start_engine` | POST | 启动引擎（分发到全部 Worker） |
+| `/api/inference` | POST | 分发推理任务 |
+| `/api/heartbeat` | POST | 接收心跳 |
+
+### 13.4 Worker 节点行为
+
+1. 启动时向 Master 注册（IP + 端口）
+2. 后台线程定期发送心跳
+3. 收到 `/api/start_engine` 后生成 `start_command.sh` 写入共享卷
+4. engine 容器读取并执行脚本
+
+### 13.5 调度策略
+
+TaskScheduler 支持三种调度策略：
+
+| 策略 | 说明 |
+|------|------|
+| `least_load` | 最小负载优先（默认） |
+| `round_robin` | 轮询 |
+| `random` | 随机 |
+
+### 13.6 K8s 部署
+
+```yaml
+env:
+  - name: DISTRIBUTED
+    value: "true"
+  - name: MASTER_IP
+    value: "192.168.1.100"           # Master 节点 IP
+  - name: NODE_IPS
+    value: "192.168.1.100,192.168.1.101,192.168.1.102"
+```
+
+---
+
+## 十四、故障排查
 
 ### 常见问题
 
@@ -891,6 +1117,9 @@ K8s 分布式 overlay 请参考：
 | 分布式 Pod 卡住 | HEAD_NODE_ADDR 不对 | 确认 rank-0 节点 IP 可达 |
 | `model_name is required` | 未传模型名 | 添加 `--model-name` 或 `MODEL_NAME` 环境变量 |
 | GPU 未被识别 | 驱动未挂载 | 确认 `--runtime nvidia` 或设备挂载正确 |
+| Accel 补丁未生效 | `ENABLE_ACCEL` 未设置 | 添加 `ENABLE_ACCEL=true` 环境变量 |
+| Worker 注册失败 | Master IP 不可达 | 检查 `MASTER_IP` 和网络连通性 |
+| Ascend 上用了 vllm | 引擎未自动升级 | 检查 `WINGS_DEVICE=ascend` 是否设置 |
 
 ### 日志位置
 
@@ -921,26 +1150,26 @@ kubectl exec -it deploy/infer -c wings-infer -- env | sort
 kubectl exec -it deploy/infer -c engine -- bash
 ```
 
-详细故障排查：参见 [doc/troubleshooting.md](doc/troubleshooting.md)
+详细故障排查：[doc/troubleshooting.md](doc/troubleshooting.md)
 
 ---
 
-## 十三、从 wings 迁移
+## 十五、从 wings 迁移
 
-### 13.1 核心原则
+### 15.1 核心原则
 
-- **CLI 接口 100% 兼容**：30 个参数名称、默认值完全一致
-- **环境变量 100% 兼容**：所有 A 使用的环境变量在 B 中均有对应
-- **端口兼容**：代理端口默认 18000，与 A 一致
+- **CLI 接口 100% 兼容**：30+ 参数名称、默认值完全一致
+- **环境变量 100% 兼容**：所有 wings 使用的环境变量在 unified 中均有对应
+- **端口兼容**：代理端口默认 18000，与 wings 一致
 
-### 13.2 迁移步骤
+### 15.2 迁移步骤
 
 1. **替换镜像**：将 wings 镜像替换为 `wings-infer:latest`
 2. **无需修改参数**：原有的 `--model-name`、`--engine` 等参数原样保留
-3. **新增 engine 容器**：B 使用双容器架构，需添加引擎容器 + 共享卷
+3. **新增 engine 容器**：unified 使用双容器架构，需添加引擎容器 + 共享卷
 4. **设置 `WINGS_SKIP_PID_CHECK=true`**：sidecar 模式下必须跳过 PID 检查
 
-### 13.3 K8s 迁移示例
+### 15.3 K8s 迁移示例
 
 ```yaml
 # 原来 (wings)
@@ -956,16 +1185,16 @@ spec:
     - name: shared-volume
       emptyDir: {}
   containers:
-    - name: wings-infer              # ← 改名（可选）
-      image: wings-infer:latest      # ← 替换镜像
-      args: ["--model-name", "DeepSeek-R1", "--engine", "vllm"]  # ← 参数不变
+    - name: wings-infer
+      image: wings-infer:latest
+      args: ["--model-name", "DeepSeek-R1", "--engine", "vllm"]
       env:
-        - name: WINGS_SKIP_PID_CHECK # ← 新增
+        - name: WINGS_SKIP_PID_CHECK
           value: "true"
       volumeMounts:
         - name: shared-volume
           mountPath: /shared-volume
-    - name: engine                   # ← 新增引擎容器
+    - name: engine
       image: vllm/vllm-openai:latest
       command: ["/bin/sh", "-c"]
       args:
@@ -977,18 +1206,20 @@ spec:
           mountPath: /shared-volume
 ```
 
-### 13.4 已知差异
+### 15.4 已知差异
 
 | 维度 | wings (A) | unified (B) | 说明 |
 |------|-----------|-------------|------|
-| 容器数 | 1 | 2 (sidecar + engine) | 需添加 engine 容器 |
+| 容器数 | 1 | 2+ (sidecar + engine + 可选 accel-init) | 需添加 engine 容器 |
 | 进程管理 | PID 文件 | K8s 容器生命周期 | B 更可靠 |
-| 分布式 | 自建 master-worker | K8s StatefulSet | B 使用 K8s 原生 |
+| 分布式 | 自建 master-worker | K8s StatefulSet 或 Master-Worker | B 支持两种模式 |
 | 硬件探测 | SDK 实时探测 | 环境变量驱动 | B 需设置 `WINGS_DEVICE_COUNT` |
+| 加速补丁 | 不支持 | Accel initContainer | B 新增能力 |
+| 引擎支持 | vllm/sglang/mindie/wings | 同上 + vllm_ascend | B 新增 Ascend 专属引擎 |
 
 ---
 
-## 十四、文档索引
+## 十六、文档索引
 
 | 文档 | 说明 |
 |------|------|
@@ -996,11 +1227,17 @@ spec:
 | [架构详解](doc/architecture.md) | 模块职责、端口规划、状态机、数据流 |
 | [故障排查](doc/troubleshooting.md) | CrashLoop、201/502/503、Ray/HCCL、Triton 等 9 类问题 |
 | [vLLM 部署](doc/deploy-vllm.md) | NVIDIA GPU 单机 + Ray 分布式 |
-| [vLLM-Ascend 部署](doc/deploy-vllm-ascend.md) | Ascend NPU 单机 + Ray 分布式 (含 Triton 补丁说明) |
+| [vLLM-Ascend 部署](doc/deploy-vllm-ascend.md) | Ascend NPU 单机 |
+| [vLLM-Ascend 分布式](doc/deploy-vllm-ascend-dist-ray.md) | Ascend NPU Ray 分布式 (含 Triton 补丁) |
 | [SGLang 部署](doc/deploy-sglang.md) | 单机 + nnodes 分布式 |
 | [MindIE 部署](doc/deploy-mindie.md) | Ascend NPU 单机 + HCCL 分布式 (含 rank table) |
+| [Accel 加速部署](doc/deploy-accel.md) | 加速包构建、initContainer 配置 |
+| [版本差异报告](doc/version-diff-report.md) | wings (A) vs unified (B) 完整对比 |
+| [Bug 修复报告](BUG_FIX_REPORT.md) | 代码审查发现的 9 个 Bug 及修复详情 |
 | [安全审计](doc/security-audit-fix-report.md) | 安全审计修复报告 |
 | [代码清理](doc/code-cleanup-log.md) | 代码清理记录 |
+
+---
 
 ## License
 
