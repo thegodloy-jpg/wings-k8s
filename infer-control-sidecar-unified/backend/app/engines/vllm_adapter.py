@@ -496,8 +496,18 @@ def build_start_script(params: Dict[str, Any]) -> str:
     # 其次环境变量，最后回退到 28020（与 wings 对齐）
     ray_port = str(params.get("ray_head_port", os.getenv("RAY_PORT", "28020")))
 
+    # ── 公共环境命令链（对齐 A 的 _build_env_commands 调用链） ─────────
+    # sidecar 容器无 GPU/NPU，使用环境变量代替 netifaces 探测网络接口
+    current_ip = os.getenv("POD_IP", get_local_ip())
+    net_if = os.getenv("NETWORK_INTERFACE", os.getenv("GLOO_SOCKET_IFNAME", "eth0"))
+    common_env_cmds: List[str] = []
+    common_env_cmds.extend(_build_base_env_commands(params, engine, root_dir))
+    common_env_cmds.extend(_build_cache_env_commands(engine))
+    common_env_cmds.extend(_build_qat_env_commands(engine))
+    common_env_cmds.extend(_build_pd_role_env_commands(engine, current_ip, net_if))
+
     if is_distributed and nnodes > 1:
-        script_parts = []
+        script_parts = list(common_env_cmds)
         is_ascend = (engine == "vllm_ascend")
 
         if backend == "ray":
@@ -583,8 +593,12 @@ def build_start_script(params: Dict[str, Any]) -> str:
                     # Detect default-route interface from /proc/net/route
                     # (ip command unavailable in vllm-ascend image; awk is universally present)
                     script_parts.append("export HCCL_SOCKET_IFNAME=$(awk '$2==\"00000000\"{print $1;exit}' /proc/net/route 2>/dev/null || echo eth0)")
+                    script_parts.append("export TP_SOCKET_IFNAME=$(awk '$2==\"00000000\"{print $1;exit}' /proc/net/route 2>/dev/null || echo eth0)")
+                    script_parts.append("export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1")
+                    script_parts.append("export ASCEND_PROCESS_LOG_PATH=/tmp/ray_vllm010")
                 else:
                     script_parts.append(f"export NCCL_SOCKET_IFNAME={os.getenv('NCCL_SOCKET_IFNAME', 'eth0')}")
+                    script_parts.append(f"export TP_SOCKET_IFNAME={os.getenv('NCCL_SOCKET_IFNAME', 'eth0')}")
                 script_parts.append("export GLOO_SOCKET_IFNAME=$(awk '$2==\"00000000\"{print $1;exit}' /proc/net/route 2>/dev/null || echo eth0)\n")
                 # Ascend: use --resources='{"NPU": 1}' instead of --num-gpus=1
                 # vllm-ascend v0.14.0rc1 requires NPU resource in Ray cluster, not GPU
@@ -622,10 +636,14 @@ def build_start_script(params: Dict[str, Any]) -> str:
                     # Set HCCL env using discovered head IP
                     script_parts.append(f"export HCCL_IF_IP=$(python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(('$HEAD_IP',{ray_port})); print(s.getsockname()[0]); s.close()\" 2>/dev/null || hostname -i)")
                     script_parts.append("export HCCL_SOCKET_IFNAME=$(awk '$2==\"00000000\"{print $1;exit}' /proc/net/route 2>/dev/null || echo eth0)")
+                    script_parts.append("export TP_SOCKET_IFNAME=$(awk '$2==\"00000000\"{print $1;exit}' /proc/net/route 2>/dev/null || echo eth0)")
+                    script_parts.append("export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1")
+                    script_parts.append("export ASCEND_PROCESS_LOG_PATH=/tmp/ray_vllm010")
                     # Worker also needs VLLM_HOST_IP for Ray node matching
                     script_parts.append("export VLLM_HOST_IP=${POD_IP:-$(python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));print(s.getsockname()[0]);s.close()\" 2>/dev/null || hostname -i)}")
                 else:
                     script_parts.append(f"export NCCL_SOCKET_IFNAME={os.getenv('NCCL_SOCKET_IFNAME', 'eth0')}")
+                    script_parts.append(f"export TP_SOCKET_IFNAME={os.getenv('NCCL_SOCKET_IFNAME', 'eth0')}")
                     # Worker's own routable IP (for Ray node-ip-address)
                     script_parts.append("export VLLM_HOST_IP=${POD_IP:-$(python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));print(s.getsockname()[0]);s.close()\" 2>/dev/null || hostname -i)}")
                     script_parts.append("for i in $(seq 1 60); do")
@@ -707,9 +725,11 @@ def build_start_script(params: Dict[str, Any]) -> str:
             "|| echo 'WARN: nnal/atb/set_env.sh not found'\n"
             "set -u\n"
         )
-        return env_block + f"exec {cmd}\n"
+        env_prefix = "\n".join(common_env_cmds) + "\n" if common_env_cmds else ""
+        return env_prefix + env_block + f"exec {cmd}\n"
 
-    return f"exec {cmd}\n"
+    env_prefix = "\n".join(common_env_cmds) + "\n" if common_env_cmds else ""
+    return env_prefix + f"exec {cmd}\n"
 
 
 def start_vllm_distributed(params: Dict):
