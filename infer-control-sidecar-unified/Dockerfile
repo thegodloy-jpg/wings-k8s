@@ -51,8 +51,12 @@ ENV http_proxy=""
 ENV https_proxy=""
 ENV APP_WORKDIR="/app"
 
-# 默认通过 wings_start.sh 启动，与 wings 原始容器接口完全兼容。
-# 编排层可直接传递 --model-name --engine 等参数。
-# 也可覆盖为: CMD ["python", "-m", "app.main", "--model-name", "xxx"]
-ENTRYPOINT ["bash", "/app/wings_start.sh"]
+# 显式声明引擎和模型参数，构建即确定运行配置。
+# ENTRYPOINT 中的参数不可被 docker run / K8s args 覆盖，只能追加。
+ENTRYPOINT ["bash", "/app/wings_start.sh", \
+            "--engine", "vllm", \
+            "--model-name", "DeepSeek-R1-Distill-Qwen-1.5B", \
+            "--model-path", "/models/DeepSeek-R1-Distill-Qwen-1.5B", \
+            "--device-count", "1", \
+            "--trust-remote-code"]
 CMD []

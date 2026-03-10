@@ -1,11 +1,9 @@
 # =============================================================================
 # Deployment: vLLM 单机推理 (NVIDIA GPU)
-# 架构:
-#   - wings-infer 容器: Sidecar 核心，生成启动脚本、运行 Proxy/Health
-#   - engine 容器:      vLLM 推理服务，等待并执行 start_command.sh
-# 共享卷:
-#   - /shared-volume: wings-infer 写入启动脚本，engine 容器执行
-#   - /models:        模型文件挂载（hostPath）
+# 引擎和模型参数已写死在 Dockerfile ENTRYPOINT 中:
+#   --engine vllm --model-name DeepSeek-R1-Distill-Qwen-1.5B
+#   --model-path /models/... --device-count 1 --trust-remote-code
+# YAML 中仅保留运行时配置（WINGS_SKIP_PID_CHECK / BACKEND_URL）
 # =============================================================================
 apiVersion: apps/v1
 kind: Deployment
@@ -37,18 +35,6 @@ spec:
             - containerPort: 18000
             - containerPort: 19000
           env:
-            - name: ENGINE
-              value: "vllm"
-            - name: MODEL_NAME
-              value: "DeepSeek-R1-Distill-Qwen-1.5B"     # CUSTOMIZE
-            - name: MODEL_PATH
-              value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"
-            - name: ENGINE_PORT
-              value: "17000"
-            - name: PORT
-              value: "18000"
-            - name: HEALTH_PORT
-              value: "19000"
             - name: WINGS_SKIP_PID_CHECK
               value: "true"
             - name: BACKEND_URL

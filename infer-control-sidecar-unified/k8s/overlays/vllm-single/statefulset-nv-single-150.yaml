@@ -46,24 +46,13 @@ spec:
           path: /mnt/nvidia-libs
           type: Directory
       containers:
+      # ---------------------------------------------------------------
+      # wings-infer: 引擎/模型参数已写死在 Dockerfile ENTRYPOINT 中
+      # ---------------------------------------------------------------
       - name: wings-infer
         image: wings-infer:unified-zhanghui
         imagePullPolicy: IfNotPresent
         env:
-        - name: ENGINE
-          value: vllm
-        - name: MODEL_NAME
-          value: DeepSeek-R1-Distill-Qwen-1.5B
-        - name: MODEL_PATH
-          value: /models/DeepSeek-R1-Distill-Qwen-1.5B
-        - name: ENGINE_PORT
-          value: "17000"
-        - name: PORT
-          value: "18000"
-        - name: HEALTH_PORT
-          value: "19000"
-        - name: TENSOR_PARALLEL_SIZE
-          value: "1"
         - name: WINGS_SKIP_PID_CHECK
           value: "true"
         - name: BACKEND_URL
