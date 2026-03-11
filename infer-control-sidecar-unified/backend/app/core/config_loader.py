@@ -20,7 +20,7 @@
 # Copyright (c) xFusion Digital Technologies Co., Ltd. 2025-2025. All rights reserved.
 # -*- coding: utf-8 -*-
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import argparse
 import json
 import logging
@@ -29,11 +29,13 @@ from pathlib import Path
 import math
 
 from app.utils.env_utils import get_master_ip, get_node_ips, get_lmcache_env, get_pd_role_env, \
-    get_config_force_env, get_soft_fp8_env, get_vllm_distributed_port, get_sglang_distributed_port, get_router_env, \
+    get_config_force_env, get_soft_fp8_env, get_soft_fp4_env, get_speculative_decoding_env, get_sparse_env, \
+    get_vllm_distributed_port, get_sglang_distributed_port, get_router_env, \
     get_router_instance_group_name_env, get_router_instance_name_env, get_router_nats_path_env, \
     get_operator_acceleration_env, get_local_ip
 from app.utils.file_utils import check_torch_dtype, get_directory_size, check_permission_640, load_json_config
-from app.utils.model_utils import ModelIdentifier
+from app.utils.model_utils import ModelIdentifier, is_qwen3_32b_nvfp4, is_deepseek_series_fp8, is_qwen3_series_fp8
+from app.utils.mmgm_utils import autodiscover_hunyuan_paths
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +94,32 @@ def _load_mapping(config_path: str, mapping_key: str) -> Dict[str, Any]:
     if not mapping:
         logger.warning("Missing/empty mapping key=%s in file=%s", mapping_key, config_path)
     return mapping
+
+
+def _set_spec_decoding_config(params):
+    """配置推测解码（Speculative Decoding）相关环境变量。
+
+    根据 params 中 enable_speculative_decode 的值设置 SD_ENABLE 环境变量，
+    供引擎启动脚本和后续流程判断是否启用推测解码。
+    """
+    if params.get("enable_speculative_decode"):
+        os.environ['SD_ENABLE'] = 'true'
+        logger.info("Spec Decoding for vllm is enabled")
+    else:
+        os.environ['SD_ENABLE'] = 'false'
+
+
+def _set_sparse_config(params):
+    """配置稀疏 KV（Sparse KV Cache）相关环境变量。
+
+    根据 params 中 enable_sparse 的值设置 SPARSE_ENABLE 环境变量，
+    供引擎启动脚本和后续流程判断是否启用稀疏 KV。
+    """
+    if params.get("enable_sparse"):
+        os.environ['SPARSE_ENABLE'] = 'true'
+        logger.info("Sparse for vllm is enabled")
+    else:
+        os.environ['SPARSE_ENABLE'] = 'false'
 
 
 def _get_h20_model_hint() -> str:
@@ -207,7 +235,15 @@ def _merge_cmd_params(hardware_env, engine_specific_defaults, cmd_known_params, 
         "seed": cmd_known_params.get("seed"),
         "enable_expert_parallel": cmd_known_params.get("enable_expert_parallel"),
         "max_num_batched_tokens": cmd_known_params.get("max_num_batched_tokens"),
-        "enable_prefix_caching": cmd_known_params.get("enable_prefix_caching")
+        "enable_prefix_caching": cmd_known_params.get("enable_prefix_caching"),
+        "enable_speculative_decode": cmd_known_params.get("enable_speculative_decode"),
+        "speculative_decode_model_path": cmd_known_params.get("speculative_decode_model_path"),
+        "enable_rag_acc": cmd_known_params.get("enable_rag_acc"),
+        "enable_auto_tool_choice": cmd_known_params.get("enable_auto_tool_choice"),
+        "enable_sparse": cmd_known_params.get("enable_sparse"),
+        "lc_sparse_threshold": cmd_known_params.get("lc_sparse_threshold"),
+        "total_budget": cmd_known_params.get("total_budget"),
+        "local_kvstore_capacity": cmd_known_params.get("local_kvstore_capacity")
     }
 
     # 根据引擎类型分发到不同的参数合并函数
@@ -222,6 +258,8 @@ def _merge_cmd_params(hardware_env, engine_specific_defaults, cmd_known_params, 
         return _merge_mindie_params(engine_specific_defaults, common_context, engine_cmd_parameter)
     elif engine == "sglang":
         return _merge_sglang_params(engine_specific_defaults, common_context, engine_cmd_parameter)
+    elif engine == "xllm":
+        return _merge_xllm_params(engine_specific_defaults, common_context, engine_cmd_parameter)
     return engine_specific_defaults
 
 
