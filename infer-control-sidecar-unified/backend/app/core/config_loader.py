@@ -263,6 +263,42 @@ def _merge_cmd_params(hardware_env, engine_specific_defaults, cmd_known_params, 
     return engine_specific_defaults
 
 
+def _merge_xllm_params(params, ctx, engine_cmd_parameter):
+    """处理 xllm 引擎的参数合并。
+
+    xllm 是华为昇腾的原生推理引擎，参数名映射表存储在
+    engine_parameter_mapping.json 的 default_to_xllm_parameter_mapping 键下。
+
+    Args:
+        params:              当前引擎参数字典（会被原地修改）
+        ctx:                 通用上下文（device、device_count 等）
+        engine_cmd_parameter: 用户 CLI 传入的引擎参数
+
+    Returns:
+        Dict[str, Any]: 合并后的引擎参数字典
+    """
+    # 加载 xllm 参数映射表
+    engine_param_map_config_path = os.path.join(
+        DEFAULT_CONFIG_DIR,
+        DEFAULT_CONFIG_FILES.get("engine_parameter_mapping")
+    )
+    xllm_param_map_config = load_json_config(engine_param_map_config_path)['default_to_xllm_parameter_mapping']
+
+    # 应用参数映射
+    for key, value in xllm_param_map_config.items():
+        if not value or engine_cmd_parameter.get(key) is None:
+            continue
+        else:
+            params[value] = engine_cmd_parameter.get(key)
+            # 专家并行参数需要转换为整数 0/1
+            if key == "enable_expert_parallel":
+                params[value] = 1 if engine_cmd_parameter.get(key) else 0
+
+    # 处理并行参数（xllm 使用 nnodes 表示张量并行度）
+    _adjust_tensor_parallelism(params, ctx["device_count"], 'nnodes')
+    return params
+
+
 def _merge_vllm_params(params, ctx, engine_cmd_parameter, model_info):
     """合并 vLLM / vLLM-Ascend 引擎专属参数。
 
@@ -296,15 +332,42 @@ def _merge_vllm_params(params, ctx, engine_cmd_parameter, model_info):
 
     #
     _set_common_params(params, engine_cmd_parameter, engine_param_map_config_path)
+    _set_function_call(params)
     _set_sequence_length(params, engine_cmd_parameter)
     _set_parallelism_params(params, ctx)
     _set_kv_cache_config(params, ctx)
     _set_router_config(params)
     _set_operator_acceleration(params, ctx)
     _set_soft_fp8(params, ctx, model_info)
+    _set_soft_fp4(params, ctx, model_info)
     _set_cuda_graph_sizes(params, ctx, model_info)
     _set_task(params, ctx)
+
+    # 对于 embedding 和 rerank 模型，强制禁用 enable_chunked_prefill 和 enable_prefix_caching
+    _validate_embedding_rerank_params(params, ctx)
+
     return params
+
+
+def _set_function_call(params):
+    """启用 function call / tool use 功能的参数校验。
+
+    仅当同时满足以下两个条件时，function call 才会生效：
+      1. 用户传入 enable_auto_tool_choice 参数
+      2. 模型支持 tool_call_parser（从配置文件中读取）
+
+    若不满足条件，则移除相关参数并记录日志。
+    """
+    if "enable_auto_tool_choice" in params:
+        if "tool_call_parser" in params:
+            logger.info("Function Call enabled")
+        else:
+            params.pop("enable_auto_tool_choice")
+            logger.warning("This model does not support Function Call")
+    else:
+        if "tool_call_parser" in params:
+            params.pop("tool_call_parser")
+            logger.info("Function Call not enabled")
 
 
 def _set_cuda_graph_sizes(params, ctx, model_info):
@@ -361,37 +424,123 @@ def _set_operator_acceleration(params, ctx):
 
 
 def _set_soft_fp8(params, ctx, model_info):
-    """启用 Soft FP8 量化推理（仅支持昇腾设备上的 DeepSeekV3 FP8 量化模型）。
+    """FP8 特性的参数配置（支持 DeepSeek / Qwen3 系列 FP8 模型）。
 
-    Soft FP8 通过 ascend_scheduler_config + torchair_graph_config 联合开启，
-    需要同时禁用 prefix caching 和专家并行（EP），固定 TP=4。
+    自动检测模型是否为 FP8 模型，并根据模型系列设置对应的量化参数：
+      - Qwen3 系列：设置 quantization='ascend'，MOE 模型禁用专家并行
+      - DeepSeek 系列：设置 quantization='ascend'，禁用 prefix caching/EP，固定 TP=4/DP=4
+
+    如果模型不是 FP8 模型，则跳过此函数，交由 _set_soft_fp4 处理。
     """
     model_architecture = model_info.model_architecture
-    model_quantize = model_info.model_quantize
-    if get_soft_fp8_env():
-        if ctx['device'] != "ascend":
-            logger.warning("Soft FP8 is only supported on Ascend devices")
-        elif model_architecture != "DeepseekV3ForCausalLM":
-            logger.warning("Soft FP8 is only supported for DeepseekV3 Series models")
-        elif model_quantize != "fp8":
-            raise ValueError("Soft FP8 is only supported for quantized FP8 models")
-        else:
-            logger.info("Will use Soft FP8 configuration")
-            params['quantization'] = 'ascend'
-            additional_config = {
-                "ascend_scheduler_config": {
-                    "enabled": True
-                },
-                "torchair_graph_config": {
-                    "enabled": True
-                }
-            }
-            params['additional_config'] = json.dumps(additional_config)
-            params['no_enable_prefix_caching'] = True
-            # DP
+    model_name = model_info.model_name
+    model_path = model_info.model_path
+
+    # 检查模型是否为 FP8 模型
+    is_fp8_model = is_qwen3_series_fp8(model_path, model_name) or is_deepseek_series_fp8(model_path)
+
+    # 如果模型不是 FP8，则跳过此函数，让 FP4 函数处理
+    if not is_fp8_model:
+        return
+
+    # 检查是否启用了 FP4 开关，如果是则给出警告但继续使用 FP8 配置
+    if get_soft_fp4_env():
+        logger.warning(f"Model {model_name} is detected as FP8 model, but Soft FP4 switch is enabled. "
+                       "Automatically correcting to use Soft FP8 configuration.")
+
+    # 检查是否启用了 FP8 开关，如果没有启用则给出提示但继续配置
+    if not get_soft_fp8_env():
+        logger.info(f"Model {model_name} is detected as FP8 model, automatically enabling Soft FP8 configuration")
+
+    if ctx['device'] != "ascend":
+        logger.warning("Soft FP8 is only supported on Ascend devices")
+        return
+    elif is_qwen3_series_fp8(model_path, model_name):
+        params['quantization'] = 'ascend'
+        # 对于 Qwen3MoeForCausalLM 模型，禁用专家并行
+        if model_architecture == "Qwen3MoeForCausalLM":
             params['enable_expert_parallel'] = False
-            params['tensor_parallel_size'] = 4
-            params['use_kunlun_atb'] = False
+            logger.info("Soft FP8 configured for Qwen3 MOE Series models")
+        else:
+            logger.info("Soft FP8 configured for Qwen3 Series models")
+    elif is_deepseek_series_fp8(model_path):
+        params['quantization'] = 'ascend'
+        params["enforce_eager"] = True
+        params['no_enable_prefix_caching'] = True
+        # 使用 DP 并行要禁用该功能
+        params['enable_expert_parallel'] = False
+        # 根据硬件配置设置张量并行大小，DeepSeek FP8 模型推荐使用 4
+        params['data_parallel_size'] = 4
+        params['tensor_parallel_size'] = 4
+        params['use_kunlun_atb'] = False
+        logger.info("Soft FP8 configured for Deekseek Series models")
+
+
+def _set_soft_fp4(params, ctx, model_info):
+    """FP4 特性的参数配置（仅支持昇腾设备上的 Qwen3-32B NVFP4 模型）。
+
+    检查模型是否为 FP4 模型，如果是则设置 quantization='ascend'。
+    如果同时启用了 FP8 开关，会给出警告但继续使用 FP4 配置。
+    """
+    model_path = model_info.model_path
+    model_name = model_info.model_name
+
+    # 检查模型是否为 FP4 模型
+    is_fp4_model = is_qwen3_32b_nvfp4(model_path)
+
+    # 如果模型不是 FP4，则跳过此函数
+    if not is_fp4_model:
+        return
+
+    # 检查是否启用了 FP8 开关，如果是则给出警告但继续使用 FP4 配置
+    if get_soft_fp8_env():
+        logger.warning(f"Model {model_name} is detected as FP4 model, but Soft FP8 switch is enabled. "
+                       "Automatically correcting to use Soft FP4 configuration.")
+
+    # 检查是否启用了 FP4 开关，如果没有启用则给出提示但继续配置
+    if not get_soft_fp4_env():
+        logger.info(f"Model {model_name} is detected as FP4 model, automatically enabling Soft FP4 configuration")
+
+    if ctx['device'] != "ascend":
+        logger.warning("Soft FP4 is only supported on Ascend (NPU) devices and will be ignored on current device")
+        return
+
+    logger.info("Will use Soft FP4 configuration")
+    params['quantization'] = 'ascend'
+
+
+def _validate_embedding_rerank_params(params, ctx):
+    """对于 embedding 和 rerank 模型，强制禁用 enable_chunked_prefill 和 enable_prefix_caching 参数。
+
+    如果用户传入了这些参数，会记录警告日志后再取消这些参数。
+
+    Args:
+        params: 参数字典
+        ctx: 包含模型类型等上下文信息的字典
+    """
+    model_type = ctx.get("model_type", "")
+
+    # 仅对 embedding 和 rerank 模型进行处理
+    if model_type not in ["embedding", "rerank"]:
+        return
+
+    # 检查并处理 enable_chunked_prefill 参数
+    if "enable_chunked_prefill" in params:
+        if params["enable_chunked_prefill"] not in [None, False, "False", 0, "0"]:
+            logger.warning(
+                f"Model type '{model_type}' does not support 'enable_chunked_prefill' parameter. "
+                f"This parameter will be disabled."
+            )
+        params.pop("enable_chunked_prefill", None)
+
+    # 检查并处理 enable_prefix_caching 参数
+    if "enable_prefix_caching" in params:
+        if params["enable_prefix_caching"] not in [None, False, "False", 0, "0"]:
+            logger.warning(
+                f"Model type '{model_type}' does not support 'enable_prefix_caching' parameter. "
+                f"This parameter will be disabled."
+            )
+        params.pop("enable_prefix_caching", None)
 
 
 def _set_common_params(params, engine_cmd_parameter, config_path):
