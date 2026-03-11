@@ -28,7 +28,10 @@ import os
 from typing import List, Dict, Literal, Union, Any
 import logging
 
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +50,7 @@ def is_npu_available() -> bool:
     """
     try:
         import torch_npu  # noqa: F401
-        return torch.npu.is_available()
+        return torch is not None and torch.npu.is_available()
     except ImportError:
         return False
 
@@ -60,7 +63,7 @@ def get_available_device() -> DeviceType:
     Returns:
         DeviceType: 'cuda'、'npu' 或 'cpu'
     """
-    if torch.cuda.is_available():
+    if torch is not None and torch.cuda.is_available():
         return "cuda"
     elif is_npu_available():
         return "npu"
@@ -77,7 +80,7 @@ def is_device_available(device: str) -> bool:
         bool: 设备可用返回 True
     """
     if device == "cuda":
-        return torch.cuda.is_available()
+        return torch is not None and torch.cuda.is_available()
     elif device == "npu":
         return is_npu_available()
     elif device == "cpu":
@@ -119,6 +122,8 @@ def get_device_preferred_dtype(device: str) -> Union[torch.dtype, None]:
     Returns:
         torch.dtype: 推荐的 PyTorch 数据类型。若设备类型不在已知范围内，返回 None。
     """
+    if torch is None:
+        return None
     if device == "cpu":
         return torch.float32
     elif device == "cuda" or device == "npu":
@@ -150,7 +155,7 @@ def empty_cache():
     注意:
         此操作不会释放被 PyTorch 张量占用的显存，仅释放缓存分配器中的空闲块。
     """
-    if torch.cuda.is_available():
+    if torch is not None and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     if is_npu_available():
@@ -181,7 +186,7 @@ def gpu_count():
     Returns:
         int: 可用设备数量
     """
-    if torch.cuda.is_available():
+    if torch is not None and torch.cuda.is_available():
         cuda_visible_devices_env = os.getenv("CUDA_VISIBLE_DEVICES", None)
 
         if cuda_visible_devices_env is None:
@@ -272,7 +277,7 @@ def get_nvidia_gpu_info() -> List[Dict[str, Any]]:
     try:
         nvmlInit()
     except Exception as e:
-        logger.error(f"Unexpected error during NVML initialization: {str(e)}")
+        logger.error("Unexpected error during NVML initialization: %s", e)
         return []
 
     try:
@@ -282,26 +287,26 @@ def get_nvidia_gpu_info() -> List[Dict[str, Any]]:
             try:
                 res.append(_get_nvidia_gpu_mem_info(i))
             except NVMLError as e:
-                logger.warning(f"Failed to get info for GPU {i}: {str(e)}")
+                logger.warning("Failed to get info for GPU %s: %s", i, e)
                 continue
             except Exception as e:
-                logger.error(f"Unexpected error getting info for GPU {i}: {str(e)}")
+                logger.error("Unexpected error getting info for GPU %s: %s", i, e)
                 continue
 
         return res
     except NVMLError as e:
-        logger.error(f"Failed to get GPU count: {str(e)}")
+        logger.error("Failed to get GPU count: %s", e)
         return []
     except Exception as e:
-        logger.error(f"Unexpected error getting GPU info: {str(e)}")
+        logger.error("Unexpected error getting GPU info: %s", e)
         return []
     finally:
         try:
             nvmlShutdown()
         except NVMLError as e:
-            logger.warning(f"Failed to shutdown NVML: {str(e)}")
+            logger.warning("Failed to shutdown NVML: %s", e)
         except Exception as e:
-            logger.error(f"Unexpected error during NVML shutdown: {str(e)}")
+            logger.error("Unexpected error during NVML shutdown: %s", e)
 
 
 def _get_npu_mem_info(npu_id: int) -> Dict[str, Any]:
@@ -340,7 +345,7 @@ def _get_npu_mem_info(npu_id: int) -> Dict[str, Any]:
             "vendor": "Ascend",
         }
     except Exception as e:
-        logger.error(f"Failed to get NPU-{npu_id} info: {str(e)}")
+        logger.error("Failed to get NPU-%s info: %s", npu_id, e)
         return {"error": str(e)}
 
 
@@ -413,11 +418,11 @@ def get_device_info() -> Dict[str, Any]:
             result_template[count_key] = len(details)
             result_template[details_key] = details
         else:
-            logger.error(f"Unsupported device type: {device}")
+            logger.error("Unsupported device type: %s", device)
             result_template[error_key] = f"Unsupported device type: {device}"
 
     except Exception as e:
-        logger.error(f"Error getting {device} device info")
+        logger.error("Error getting %s device info", device)
         result_template[error_key] = str(e)
     return result_template
 

@@ -52,6 +52,7 @@ MindIE 引擎适配器。
 import json
 import logging
 import os
+import shlex
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
@@ -63,18 +64,21 @@ root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 
 
 def _sanitize_shell_path(path: str) -> str:
-    """从文件路径中移除 shell 元字符，防止命令注入攻击。
+    """对路径进行 shell 安全转义，防止命令注入攻击。
 
-    MindIE 配置路径会被嵌入到生成的 shell 脚本中，
-    必须确保路径安全，仅保留合法字符。
+    使用 shlex.quote() 进行标准 POSIX shell 转义，
+    相比简单的正则过滤更安全且不会破坏包含空格的合法路径。
+
+    注意：返回值已包含外部引号（如 '/path/to/file'），
+    嵌入 shell 脚本时不需要再加引号。
 
     Args:
         path: 原始文件路径字符串
 
     Returns:
-        str: 仅包含字母、数字、下划线、斜杠、点、横线的安全路径
+        str: 经过 shell 安全转义的路径
     """
-    return re.sub(r"[^a-zA-Z0-9/_.-]", "", path)
+    return shlex.quote(path)
 
 
 # =============================================================================
@@ -87,14 +91,14 @@ def _sanitize_shell_path(path: str) -> str:
 #   - MINDIE_WORK_DIR:   自定义工作目录
 #   - MINDIE_CONFIG_PATH: 自定义配置文件路径
 # =============================================================================
-MINDIE_WORK_DIR: str = _sanitize_shell_path(os.getenv(
+MINDIE_WORK_DIR: str = os.getenv(
     "MINDIE_WORK_DIR",
     "/usr/local/Ascend/mindie/latest/mindie-service"
-))
-MINDIE_CONFIG_PATH: str = _sanitize_shell_path(os.getenv(
+)
+MINDIE_CONFIG_PATH: str = os.getenv(
     "MINDIE_CONFIG_PATH",
     os.path.join(MINDIE_WORK_DIR, "conf/config.json")
-))
+)
 
 # 默认端口配置
 DEFAULT_SERVER_PORT = 18000              # MindIE HTTP API 端口
@@ -393,7 +397,7 @@ def build_start_command(params: Dict[str, Any]) -> str:
     Returns:
         str: 切换到工作目录并启动守护进程的命令
     """
-    return f"cd {MINDIE_WORK_DIR} && exec ./bin/mindieservice_daemon"
+    return f"cd {shlex.quote(MINDIE_WORK_DIR)} && exec ./bin/mindieservice_daemon"
 
 
 def build_start_script(params: Dict[str, Any]) -> str:
@@ -566,7 +570,12 @@ def build_start_script(params: Dict[str, Any]) -> str:
     logger.info("[mindie] Generating start_command.sh: %s, worldSize=%d", dist_label, world_size)
 
     # ── 8. Config merge-update + daemon start ──────────────────────────────
+    # 通过环境变量传递路径给内联 Python，避免字符串注入风险
+    safe_config_path = shlex.quote(MINDIE_CONFIG_PATH)
+    safe_work_dir = shlex.quote(MINDIE_WORK_DIR)
     script = f"""{env_block}# ── Merge-update MindIE config.json (preserve original fields, override only what changed) ──
+export _MINDIE_CONFIG_PATH={safe_config_path}
+
 cat > /tmp/_mindie_overrides.json << 'OVERRIDES_EOF'
 {overrides_json}
 OVERRIDES_EOF
@@ -574,7 +583,7 @@ OVERRIDES_EOF
 python3 << 'MERGE_SCRIPT_EOF'
 import json, os, sys
 
-CONFIG_PATH = '{MINDIE_CONFIG_PATH}'
+CONFIG_PATH = os.environ['_MINDIE_CONFIG_PATH']
 OVERRIDES_PATH = '/tmp/_mindie_overrides.json'
 
 # 1. Load original config.json from image
@@ -616,7 +625,7 @@ print(json.dumps(config, indent=2, ensure_ascii=False))
 MERGE_SCRIPT_EOF
 
 # ── Start MindIE daemon (background + wait, per official boot.sh) ────────────
-cd '{MINDIE_WORK_DIR}'
+cd {safe_work_dir}
 ./bin/mindieservice_daemon &
 MINDIE_PID=$!
 echo "[mindie] Daemon started as PID $MINDIE_PID"

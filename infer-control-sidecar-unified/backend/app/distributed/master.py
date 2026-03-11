@@ -238,6 +238,7 @@ def _send_single_request(node_ip: str, port: int, params: dict):
     return requests.post(
         f"{worker_url}/api/start_engine",
         json={"engine": params["engine"], "params": params["params"]},
+        timeout=30,
     )
 
 

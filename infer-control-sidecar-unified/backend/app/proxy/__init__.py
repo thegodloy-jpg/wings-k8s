@@ -6,7 +6,6 @@
 #
 #   - gateway.py        —— 主业务代理（FastAPI 应用），转发 OpenAI 兼容请求到后端引擎
 #                          支持流式/非流式转发、自动重试、排队控制、观测头注入
-#   - simple_proxy.py   —— 简化版代理（保留用于回退和测试），含 TTFT 测量
 #   - health.py         —— 健康状态机核心，持续探测后端 /health + PID 存活
 #   - health_service.py —— 独立健康服务（运行在 health 端口），供 K8s 探针使用
 #   - http_client.py    —— 异步 HTTP 客户端配置（HTTP/2、连接池、keepalive）

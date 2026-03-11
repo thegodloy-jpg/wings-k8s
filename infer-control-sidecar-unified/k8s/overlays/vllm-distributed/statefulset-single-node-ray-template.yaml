@@ -1,0 +1,332 @@
+# =============================================================================
+# vLLM Ray 分布式 StatefulSet 模板 — 单机多 GPU（Pod 网络 + hostPath IP 交换）
+#
+# 适用场景:
+#   在同一台物理机的 k3s 节点上，使用多张 GPU 进行 vLLM + Ray 分布式推理。
+#   每张 GPU 对应一个 Pod（StatefulSet replica），通过 Pod 网络（CNI）获得
+#   独立 IP，并利用 hostPath 卷交换 Pod IP 实现 master/worker 协调。
+#
+# 使用前须知:
+#   本模板中所有 # ← CUSTOMIZE 注释标记的地方都需要根据实际环境调整。
+#   搜索 "← CUSTOMIZE" 即可找到所有需要修改的配置项。
+#
+# 核心设计:
+#   1. Pod 网络而非 hostNetwork: 避免同节点多 Pod 端口冲突 & 相同 IP 导致角色
+#      判断失败的问题
+#   2. hostPath IP 交换: 当 CoreDNS 不可用或跨节点路由不通时（Docker-in-Docker
+#      场景中常见），Pod 通过共享 hostPath 目录交换各自 IP
+#   3. NODE_RANK 自动派生: 从 StatefulSet pod name（infer-{N}）的序号 N 推导
+#   4. GPU 隔离: CUDA_VISIBLE_DEVICES 由序号派生（Pod-0 → GPU0, Pod-1 → GPU1...）
+#   5. 同节点调度: 所有 Pod 通过 nodeName 固定到同一节点
+#
+# 端口分配（每 Pod 独立 IP，无冲突）:
+#   Master (infer-0): 16000(master API) + 17000(vllm) + 18000(proxy) +
+#                     19000(health) + 28020(ray head)
+#   Worker (infer-N): 16001(worker API) + 19001(health) + Ray worker(动态端口)
+#
+# NVIDIA vs Ascend 注意事项:
+#   NVIDIA:  NCCL_SOCKET_IFNAME=eth0, ray --num-gpus=1
+#   Ascend:  HCCL 配置, ray --resources='{"NPU": 1}'
+#   本模板仅适用于 NVIDIA GPU。Ascend 部署请参考 deploy-vllm-ascend-dist-ray.md
+#
+# 验证记录:
+#   - 2026-03-10: 在 7.6.16.150 (2×RTX 4090) 上验证通过
+#     k3s Docker-in-Docker, DeepSeek-R1-Distill-Qwen-1.5B, TP=1×2节点
+# =============================================================================
+
+---
+# ========================
+# Namespace (如不存在)
+# ========================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wings-infer       # ← CUSTOMIZE: 命名空间
+
+---
+# ========================
+# Headless Service (StatefulSet 必需)
+# ========================
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-hl
+  namespace: wings-infer   # ← CUSTOMIZE: 与上方一致
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: infer-vllm
+  ports:
+    - name: engine
+      port: 17000
+    - name: proxy
+      port: 18000
+    - name: health
+      port: 19000
+
+---
+# ========================
+# ClusterIP Service (仅暴露 master Pod)
+# ========================
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-api
+  namespace: wings-infer   # ← CUSTOMIZE
+spec:
+  selector:
+    app.kubernetes.io/name: infer-vllm
+    statefulset.kubernetes.io/pod-name: infer-0   # 只路由到 master
+  ports:
+    - name: proxy
+      port: 18000
+      targetPort: 18000
+    - name: health
+      port: 19000
+      targetPort: 19000
+
+---
+# ========================
+# StatefulSet
+# ========================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: infer
+  namespace: wings-infer   # ← CUSTOMIZE
+spec:
+  serviceName: infer-hl
+  replicas: 2              # ← CUSTOMIZE: = GPU 数量（每 GPU 一个 Pod）
+  podManagementPolicy: Parallel   # 所有 Pod 同时启动
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: infer-vllm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: infer-vllm
+    spec:
+      # ----------- 调度 -----------
+      # 所有 Pod 必须在同一节点
+      nodeName: YOUR_NODE_NAME     # ← CUSTOMIZE: kubectl get nodes -o wide 获取
+
+      # ----------- 网络 & DNS -----------
+      # 不使用 hostNetwork — Pod 网络提供独立 IP
+      # CoreDNS 跨节点不可达时使用 Default DNS (宿主机 /etc/resolv.conf)
+      dnsPolicy: Default
+
+      # ----------- 卷定义 -----------
+      volumes:
+      # sidecar 与 engine 共享: start_command.sh 传递
+      - name: shared-volume
+        emptyDir: {}
+
+      # 模型目录 (hostPath)
+      - name: model-volume
+        hostPath:
+          path: /mnt/models           # ← CUSTOMIZE: 宿主机上模型存放路径
+          type: DirectoryOrCreate
+
+      # IP 交换目录: 同节点 Pod 互写各自 Pod IP
+      - name: ip-exchange
+        hostPath:
+          path: /tmp/wings-ip-exchange
+          type: DirectoryOrCreate
+
+      # 共享内存: Ray 分布式通信需要
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi             # ← CUSTOMIZE: 大模型可能需要更大
+
+      # ----------- GPU 设备 (hostPath 方式) -----------
+      # ← CUSTOMIZE: 根据实际 GPU 数量添加/删减
+      # 如果 k8s 集群有 nvidia-device-plugin，可改用 resources.limits 方式
+      - name: dev-nvidia0
+        hostPath:
+          path: /dev/nvidia0
+          type: CharDevice
+      - name: dev-nvidia1
+        hostPath:
+          path: /dev/nvidia1
+          type: CharDevice
+      - name: dev-nvidiactl
+        hostPath:
+          path: /dev/nvidiactl
+          type: CharDevice
+      - name: dev-nvidia-uvm
+        hostPath:
+          path: /dev/nvidia-uvm
+          type: CharDevice
+      # NVIDIA 用户态库 (如果不在标准路径)
+      - name: nvidia-libs
+        hostPath:
+          path: /mnt/nvidia-libs      # ← CUSTOMIZE: nvidia 库路径，或移除
+          type: Directory
+
+      containers:
+      # ===============================================================
+      # Container 1: wings-infer (Sidecar)
+      # 职责: 角色判定、生成启动命令、代理转发、健康检查
+      # ===============================================================
+      - name: wings-infer
+        image: wings-infer:latest              # ← CUSTOMIZE: sidecar 镜像
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          # === 从 StatefulSet Pod 名推导 NODE_RANK ===
+          export NODE_RANK=${POD_NAME##*-}
+
+          # === hostPath IP 交换 ===
+          # 每个 Pod 写入自身 IP，等待对方写入
+          rm -f /ip-exchange/pod-${NODE_RANK}-ip
+          echo $POD_IP > /ip-exchange/pod-${NODE_RANK}-ip
+
+          if [ "$NODE_RANK" = "0" ]; then
+            # --- Master ---
+            export MASTER_IP=$POD_IP
+            export HEAD_NODE_ADDR=$POD_IP
+            # 等待所有 worker 写入 IP (每 2 秒检查一次，最多 120 秒)
+            NNODES_VAL=${NNODES:-2}
+            for rank in $(seq 1 $((NNODES_VAL - 1))); do
+              for i in $(seq 1 60); do
+                [ -f /ip-exchange/pod-${rank}-ip ] && break
+                sleep 2
+              done
+            done
+            # 收集所有 worker IP
+            WORKER_IPS=""
+            for rank in $(seq 1 $((NNODES_VAL - 1))); do
+              WIP=$(cat /ip-exchange/pod-${rank}-ip 2>/dev/null || echo "unknown")
+              WORKER_IPS="${WORKER_IPS},${WIP}"
+            done
+            export NODE_IPS="${POD_IP}${WORKER_IPS}"
+          else
+            # --- Worker ---
+            for i in $(seq 1 60); do
+              [ -f /ip-exchange/pod-0-ip ] && break
+              sleep 2
+            done
+            export MASTER_IP=$(cat /ip-exchange/pod-0-ip 2>/dev/null || echo "unknown")
+            export HEAD_NODE_ADDR=$MASTER_IP
+            export NODE_IPS="${MASTER_IP},${POD_IP}"
+          fi
+
+          echo "[wings] POD_NAME=$POD_NAME NODE_RANK=$NODE_RANK"
+          echo "[wings] POD_IP=$POD_IP MASTER_IP=$MASTER_IP"
+          echo "[wings] NODE_IPS=$NODE_IPS"
+          exec python -m app.main
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: DISTRIBUTED
+          value: "true"
+        - name: RANK_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: ENGINE
+          value: vllm
+        - name: DISTRIBUTED_EXECUTOR_BACKEND
+          value: ray
+        - name: TENSOR_PARALLEL_SIZE
+          value: "1"                    # ← CUSTOMIZE: 每节点 TP 数 (通常 = 1)
+        - name: NNODES
+          value: "2"                    # ← CUSTOMIZE: = replicas = GPU 数量
+        - name: MODEL_NAME
+          value: YOUR_MODEL_NAME        # ← CUSTOMIZE: 模型名称
+        - name: MODEL_PATH
+          value: /models/YOUR_MODEL     # ← CUSTOMIZE: 容器内模型路径
+        - name: ENGINE_PORT
+          value: "17000"
+        - name: PORT
+          value: "18000"
+        - name: HEALTH_PORT
+          value: "19000"
+        - name: WINGS_SKIP_PID_CHECK
+          value: "true"
+        volumeMounts:
+        - name: shared-volume
+          mountPath: /shared-volume
+        - name: model-volume
+          mountPath: /models
+          readOnly: true
+        - name: ip-exchange
+          mountPath: /ip-exchange
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+
+      # ===============================================================
+      # Container 2: engine (vLLM)
+      # 职责: Ray head/worker 启动、vLLM serve 执行
+      # ===============================================================
+      - name: engine
+        image: vllm/vllm-openai:v0.13.0         # ← CUSTOMIZE: vLLM 引擎镜像
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true           # Ray + NCCL 需要
+        command: ["/bin/sh", "-c"]
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        args:
+        - |
+          # GPU 隔离: Pod 序号 → CUDA_VISIBLE_DEVICES
+          ORDINAL=${POD_NAME##*-}
+          export CUDA_VISIBLE_DEVICES=$ORDINAL
+          echo "[engine] POD_NAME=$POD_NAME ordinal=$ORDINAL GPU=$CUDA_VISIBLE_DEVICES POD_IP=$POD_IP"
+
+          # 等待 sidecar 生成启动命令
+          echo '[engine] Waiting for start_command.sh...'
+          while [ ! -f /shared-volume/start_command.sh ]; do sleep 2; done
+          echo '[engine] Executing start_command.sh:'
+          cat /shared-volume/start_command.sh
+          echo '---'
+
+          # 设置 LD_LIBRARY_PATH (如有自定义 nvidia 库路径)
+          export LD_LIBRARY_PATH=/mnt/nvidia-libs:${LD_LIBRARY_PATH:-}
+          cd /shared-volume && bash start_command.sh
+        volumeMounts:
+        - name: shared-volume
+          mountPath: /shared-volume
+        - name: model-volume
+          mountPath: /models
+          readOnly: true
+        # ← CUSTOMIZE: GPU 设备挂载 — 与上方 volumes 对应
+        - name: dev-nvidia0
+          mountPath: /dev/nvidia0
+        - name: dev-nvidia1
+          mountPath: /dev/nvidia1
+        - name: dev-nvidiactl
+          mountPath: /dev/nvidiactl
+        - name: dev-nvidia-uvm
+          mountPath: /dev/nvidia-uvm
+        - name: nvidia-libs
+          mountPath: /mnt/nvidia-libs
+        - name: dshm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            cpu: "2"
+            memory: 4Gi
+          limits:
+            cpu: "12"              # ← CUSTOMIZE: 根据节点规格调整
+            memory: 32Gi           # ← CUSTOMIZE: 根据模型大小调整

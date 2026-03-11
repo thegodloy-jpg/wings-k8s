@@ -71,7 +71,7 @@ def _jlog(evt: str, **fields):
         log_entry = {"evt": evt, **fields}
         C.logger.info(json.dumps(log_entry, ensure_ascii=False))
     except (TypeError, ValueError) as e:
-        C.logger.error(f"Failed to serialize log entry: {log_entry}", exc_info=e)
+        C.logger.error("Failed to serialize log entry: %s", log_entry, exc_info=e)
     except Exception as e:
         C.logger.error("Unexpected error while writing log", exc_info=e)
 
@@ -87,7 +87,7 @@ def _elog(evt: str, **fields):
         log_entry = {"evt": evt, **fields}
         C.logger.error(json.dumps(log_entry, ensure_ascii=False))
     except (TypeError, ValueError) as e:
-        C.logger.error(f"Failed to serialize log entry: {log_entry}", exc_info=e)
+        C.logger.error("Failed to serialize log entry: %s", log_entry, exc_info=e)
     except Exception as e:
         C.logger.error("Unexpected error while writing log", exc_info=e)
 

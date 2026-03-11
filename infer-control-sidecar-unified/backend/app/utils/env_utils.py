@@ -217,7 +217,7 @@ def get_pd_role_env():
     """
     pd_role = os.getenv('PD_ROLE', '')
     if pd_role and pd_role not in ("P", "D"):
-        logger.warning(f"PD_ROLE id not P or D, PD is not enabled")
+        logger.warning("PD_ROLE id not P or D, PD is not enabled")
         pd_role = ''
     return pd_role
 

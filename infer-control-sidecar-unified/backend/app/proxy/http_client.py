@@ -5,7 +5,7 @@
 #
 # 功能概述:
 #   本模块提供统一配置的 httpx.AsyncClient 实例创建函数，
-#   供 gateway/simple_proxy 使用。
+#   供 gateway 使用。
 #
 # 配置要点:
 #   - 启用 keep-alive 连接复用，减少 TCP 建连开销

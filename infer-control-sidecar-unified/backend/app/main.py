@@ -23,6 +23,12 @@
        - 监控子进程状态，异常退出时自动拉起（守护进程模式）
        - 处理系统信号（SIGINT/SIGTERM）实现优雅退出
 
+    4. 分布式协调（DISTRIBUTED=true 时激活）
+       - 通过 NODE_RANK 或 IP 比较自动判断 master/worker 角色
+       - Master: 生成 rank0 脚本 + 启动 Master API + 等待 Worker 注册后分发启动指令
+       - Worker: 启动 Worker API + 向 Master 注册 + 接收启动指令写入共享卷
+       - 支持 NODE_IPS 中的 DNS 名称（通过 _resolve() 解析后比较）
+
 Sidecar 架构说明：
     ┌─────────────────────────────────────────────────────────────┐
     │                      K8s Pod                                │
@@ -306,6 +312,23 @@ def _determine_role() -> str:
     if not distributed:
         return "standalone"
 
+    # 优先检查 NODE_RANK 环境变量：
+    # hostNetwork 模式下同一宿主机的多个 Pod 共享 IP，
+    # 无法通过 RANK_IP vs MASTER_IP 区分角色。
+    # 此时显式设置 NODE_RANK 可直接确定角色，跳过 IP 比较。
+    node_rank_env = os.getenv("NODE_RANK", "").strip()
+    if node_rank_env:
+        try:
+            rank = int(node_rank_env)
+            if rank == 0:
+                logger.info("Role determined: MASTER (NODE_RANK=0)")
+                return "master"
+            else:
+                logger.info("Role determined: WORKER (NODE_RANK=%d)", rank)
+                return "worker"
+        except ValueError:
+            logger.warning("NODE_RANK=%s is not an integer, falling back to IP comparison", node_rank_env)
+
     master_ip = get_master_ip()
     local_ip = get_local_ip()
 
@@ -417,15 +440,29 @@ def _wait_and_distribute_to_workers(
     poll_interval = 5
     start_time = time.time()
 
+    def _resolve(host: str) -> str:
+        """将 DNS 名称解析为 IP 地址；已是 IP 或解析失败时原样返回。
+
+        用于处理 NODE_IPS 中可能包含的 DNS 名称（如 'infer-1.infer-hl'），
+        使其能与 Worker 注册时上报的 Pod IP 进行正确比较。
+        """
+        try:
+            return socket.gethostbyname(host)
+        except socket.error:
+            return host
+
     while time.time() - start_time < max_wait_sec:
         try:
             resp = _requests.get(f"{master_url}/api/nodes", timeout=10)
             resp.raise_for_status()
             registered = {n["ip"] for n in resp.json().get("nodes", [])}
-            if all(ip in registered for ip in worker_ips):
+            # NODE_IPS may contain DNS names (e.g. "infer-1.infer-hl");
+            # registered set contains actual Pod IPs. Resolve before comparison.
+            resolved_workers = {_resolve(ip) for ip in worker_ips}
+            if resolved_workers.issubset(registered):
                 logger.info(
-                    "All %d worker nodes registered with master",
-                    len(worker_ips),
+                    "All %d worker nodes registered with master (resolved: %s)",
+                    len(worker_ips), resolved_workers,
                 )
                 break
         except Exception as exc:
@@ -591,8 +628,18 @@ def _run_worker_mode(
     logger.info("Worker API starting, registering with master at %s", master_ip)
     time.sleep(2)  # 等待 Worker 就绪
 
-    # ---- 2. 仅启动 health 子服务（非 rank0 不需要 proxy） ----
-    processes = [p for p in _build_processes(port_plan) if p.name == "health"]
+    # ---- 2. 启动 health 子服务（使用偏移端口避免 hostNetwork 冲突） ----
+    # Worker 的 health 端口在基准端口上偏移 +1（如 19000 → 19001），
+    # 避免 hostNetwork 模式下与同一宿主机上 Master Pod 的 19000 端口冲突。
+    # K8s StatefulSet 中 Worker Pod 的 readinessProbe/livenessProbe 需对应配置。
+    worker_health_port = port_plan.health_port + 1
+    worker_port_plan = PortPlan(
+        enable_proxy=port_plan.enable_proxy,
+        backend_port=port_plan.backend_port,
+        proxy_port=port_plan.proxy_port,
+        health_port=worker_health_port,
+    )
+    processes = [p for p in _build_processes(worker_port_plan) if p.name == "health"]
     for proc in processes:
         _start(proc)
 
@@ -609,7 +656,7 @@ def _run_worker_mode(
     logger.info(
         "Worker mode running: health=%d "
         "(waiting for master to dispatch engine start)",
-        port_plan.health_port,
+        worker_health_port,
     )
 
     try:

@@ -1,0 +1,265 @@
+# =============================================================================
+#  wings-infer Sidecar 架构 —— 完整 YAML 样例
+# =============================================================================
+#
+#  本文件展示 wings-infer 项目的核心部署模式：双容器 Sidecar 架构。
+#  每个 Pod 包含两个容器：
+#    1. wings-infer (控制面) — 解析参数、生成启动脚本、运行 proxy/health
+#    2. engine     (数据面) — 等待脚本、执行推理引擎 (vllm/sglang/mindie)
+#
+#  两个容器通过 emptyDir 共享卷 (/shared-volume) 传递启动脚本，
+#  实现跨容器的命令传递和参数同步。
+#
+#  使用方式:
+#    1. 替换所有 CUSTOMIZE 标记的值
+#    2. kubectl apply -f example-sidecar-template.yaml
+#    3. 通过 proxy 端口 (18000) 访问推理服务
+#
+#  支持模式:
+#    - 单机模式:    replicas=1, DISTRIBUTED 留空
+#    - 分布式模式:  replicas=N, DISTRIBUTED=true, 配置 MASTER_IP/NODE_IPS
+#
+# =============================================================================
+
+# ---------- Headless Service (分布式模式需要) ----------
+apiVersion: v1
+kind: Service
+metadata:
+  name: infer-headless
+  namespace: wings-infer              # CUSTOMIZE: 命名空间
+spec:
+  clusterIP: None                     # Headless: 直接解析 Pod IP
+  selector:
+    app: wings-infer
+  ports:
+  - name: proxy
+    port: 18000
+  - name: health
+    port: 19000
+  - name: engine
+    port: 17000
+
+---
+# ---------- StatefulSet ----------
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: infer
+  namespace: wings-infer              # CUSTOMIZE: 命名空间
+spec:
+  serviceName: infer-headless
+  replicas: 1                         # CUSTOMIZE: 单机=1, 分布式=N
+  selector:
+    matchLabels:
+      app: wings-infer
+  template:
+    metadata:
+      labels:
+        app: wings-infer
+    spec:
+      # ==================== 卷定义 ====================
+      volumes:
+      # ★ 共享卷: wings-infer 和 engine 之间的桥梁
+      #   wings-infer 将生成的 start_command.sh 写入此卷
+      #   engine 容器轮询检测此卷中的脚本并执行
+      - name: shared-volume
+        emptyDir:
+          sizeLimit: 1Gi
+
+      # 模型文件挂载
+      - name: model-volume
+        hostPath:
+          path: /mnt/models           # CUSTOMIZE: 宿主机模型路径
+          type: DirectoryOrCreate
+
+      # ==================== 容器定义 ====================
+      containers:
+
+      # ============================================================
+      #  容器 1: wings-infer (控制面 / Sidecar)
+      # ============================================================
+      #  职责:
+      #    ① 解析启动参数 (CLI + 环境变量 → LaunchArgs)
+      #    ② 检测硬件 (nvidia/ascend) + 加载引擎配置
+      #    ③ 生成 engine 启动脚本 → 写入 /shared-volume/start_command.sh
+      #    ④ 启动 proxy (:18000) 反向代理到 engine (:17000)
+      #    ⑤ 启动 health (:19000) 健康检查服务
+      #    ⑥ [分布式] Master/Worker 角色协调
+      #
+      #  不需要 GPU，镜像体积小 (~462MB)
+      # ============================================================
+      - name: wings-infer
+        image: wings-infer:latest     # CUSTOMIZE: sidecar 镜像
+        imagePullPolicy: IfNotPresent
+
+        # ---- 启动方式 ----
+        # 方式 A (默认): 不设置 command/args，走 Dockerfile ENTRYPOINT:
+        #   bash /app/wings_start.sh --engine vllm --model-name xxx ...
+        #   wings_start.sh 解析 CLI → 设置环境变量 → exec python -m app.main
+        #
+        # 方式 B (定制): 覆盖 command/args，直接调用 Python:
+        #   command: ["/bin/sh", "-c"]
+        #   args: ["exec python -m app.main"]
+        #   适用于需要在启动前做额外操作的场景 (如 IP 交换)
+
+        # ---- 端口 ----
+        ports:
+        - containerPort: 18000        # proxy 反向代理
+          name: proxy
+        - containerPort: 19000        # 健康检查
+          name: health
+
+        # ---- 环境变量 ----
+        #  所有参数既可通过 CLI (wings_start.sh) 传入，
+        #  也可通过环境变量传入 (start_args_compat.py 的 _env() 读取)
+        env:
+        # --- 必需参数 ---
+        - name: MODEL_NAME
+          value: "DeepSeek-R1-Distill-Qwen-1.5B"    # CUSTOMIZE
+        - name: MODEL_PATH
+          value: "/models/DeepSeek-R1-Distill-Qwen-1.5B"  # CUSTOMIZE
+
+        # --- 引擎选择 ---
+        - name: ENGINE
+          value: "vllm"               # CUSTOMIZE: vllm / sglang / mindie
+
+        # --- 端口配置 ---
+        - name: ENGINE_PORT
+          value: "17000"              # engine 推理端口
+        - name: PORT
+          value: "18000"              # proxy 端口
+        - name: HEALTH_PORT
+          value: "19000"              # 健康检查端口
+
+        # --- 代理控制 ---
+        - name: BACKEND_URL
+          value: "http://127.0.0.1:17000"  # proxy 转发目标 (同 Pod 内 engine)
+        - name: WINGS_SKIP_PID_CHECK
+          value: "true"               # sidecar 模式跳过 PID 检查
+
+        # --- 分布式参数 (单机模式可省略) ---
+        # - name: DISTRIBUTED
+        #   value: "true"             # 启用分布式模式
+        # - name: MASTER_IP
+        #   value: "10.0.0.1"         # Master 节点 IP
+        # - name: NODE_IPS
+        #   value: "10.0.0.1,10.0.0.2"  # 所有节点 IP，逗号分隔
+        # - name: RANK_IP
+        #   valueFrom:
+        #     fieldRef:
+        #       fieldPath: status.podIP  # Downward API 注入 Pod IP
+        # - name: NNODES
+        #   value: "2"                # 总节点数
+
+        # ---- 挂载卷 ----
+        volumeMounts:
+        - name: shared-volume         # ★ 写入 start_command.sh
+          mountPath: /shared-volume
+        - name: model-volume
+          mountPath: /models
+          readOnly: true
+
+        # ---- 资源限制 (不需要 GPU) ----
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+
+        # ---- 健康检查 ----
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 19000
+          initialDelaySeconds: 60     # 等待模型加载
+          periodSeconds: 10
+          failureThreshold: 36        # 6 分钟超时
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 19000
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          failureThreshold: 5
+
+      # ============================================================
+      #  容器 2: engine (数据面 / 推理引擎)
+      # ============================================================
+      #  职责:
+      #    ① 等待 wings-infer 生成的 start_command.sh 出现
+      #    ② 执行启动脚本 → 启动实际推理引擎 (vllm/sglang/mindie)
+      #    ③ 在 :17000 端口提供推理 API
+      #
+      #  需要 GPU，镜像体积大 (~23GB)
+      # ============================================================
+      - name: engine
+        image: vllm/vllm-openai:v0.13.0   # CUSTOMIZE: 引擎镜像
+        # sglang:  lmsysorg/sglang:latest
+        # mindie:  mindie 对应镜像
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true            # GPU 设备访问需要
+
+        # ---- 启动命令: 轮询等待 → 执行脚本 ----
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          echo '[engine] Waiting for start_command.sh from wings-infer...'
+          # ★ 轮询等待 wings-infer 写入启动脚本
+          while [ ! -f /shared-volume/start_command.sh ]; do
+            sleep 2
+          done
+          echo '[engine] start_command.sh found! Executing:'
+          cat /shared-volume/start_command.sh
+          echo '---'
+          # ★ 执行 wings-infer 生成的启动脚本
+          cd /shared-volume && bash start_command.sh
+
+        # ---- 挂载卷 ----
+        volumeMounts:
+        - name: shared-volume         # ★ 读取 start_command.sh
+          mountPath: /shared-volume
+        - name: model-volume
+          mountPath: /models
+          readOnly: true
+
+        # ---- 资源限制 (需要 GPU) ----
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "12"
+            memory: "32Gi"
+            # nvidia.com/gpu: "1"     # CUSTOMIZE: GPU 资源 (需要 device plugin)
+
+# =============================================================================
+#  执行流程图:
+#
+#  kubectl apply
+#       ↓
+#  K8s 创建 Pod → 同时启动两个容器
+#       ↓
+#  ┌─ wings-infer ──────────────────┐   ┌─ engine ─────────────────────────┐
+#  │ (方式A) wings_start.sh 解析CLI   │   │ while [ ! -f start_command.sh ] │
+#  │         → export 环境变量        │   │   sleep 2                       │
+#  │         → exec python -m app.main│   │ done                           │
+#  │                                  │   │                                │
+#  │ (方式B) 直接 python -m app.main  │   │ # 等待中...                     │
+#  │                                  │   │                                │
+#  │ app.main:                        │   │                                │
+#  │   ① parse_launch_args()          │   │                                │
+#  │   ② detect_hardware()            │   │                                │
+#  │   ③ build_launcher_plan()        │   │                                │
+#  │   ④ _write_start_command() ──────┼──→│ ★ 检测到文件！                  │
+#  │   ⑤ 启动 proxy:18000            │   │ bash start_command.sh          │
+#  │   ⑥ 启动 health:19000           │   │   → python3 -m vllm... :17000  │
+#  │                                  │   │                                │
+#  │ proxy:18000 ──→ 转发请求 ──→──→──┼──→│ engine:17000                   │
+#  └──────────────────────────────────┘   └────────────────────────────────┘
+#
+#  用户请求: curl http://POD_IP:18000/v1/chat/completions
+#            → proxy 转发到 → engine:17000 → 返回推理结果
+# =============================================================================

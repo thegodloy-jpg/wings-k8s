@@ -188,7 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model-type", default=_env("MODEL_TYPE", "auto"))
     p.add_argument("--save-path", default=_env("SAVE_PATH", "/opt/wings/outputs"))
 
-    _add_bool(p, "--trust-remote-code", "TRUST_REMOTE_CODE", True)
+    _add_bool(p, "--trust-remote-code", "TRUST_REMOTE_CODE", False)
     p.add_argument("--dtype", default=_env("DTYPE", "auto"))
     p.add_argument("--kv-cache-dtype", default=_env("KV_CACHE_DTYPE", "auto"))
     p.add_argument("--quantization", default=_env("QUANTIZATION", ""))

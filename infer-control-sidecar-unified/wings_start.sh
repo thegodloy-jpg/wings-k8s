@@ -300,37 +300,38 @@ export RAG_ACC_ENABLED="${ENABLE_RAG_ACC:-false}"
 #
 # 虽然环境变量已导出，但 app.main 也支持 CLI 参数（优先级高于环境变量）。
 # 这里同时传递 CLI 参数以确保与 A 的行为一模一样。
+# 使用数组而非字符串拼接，避免路径含空格时发生 word-splitting。
 #
-APP_ARGS="--model-name $MODEL_NAME --model-path $MODEL_PATH"
+APP_ARGS=("--model-name" "$MODEL_NAME" "--model-path" "$MODEL_PATH")
 
-[ -n "${SAVE_PATH:-}" ]               && APP_ARGS+=" --save-path $SAVE_PATH"
-[ -n "${ENGINE:-}" ]                   && APP_ARGS+=" --engine $ENGINE"
-[ "${TRUST_REMOTE_CODE:-}" = true ]    && APP_ARGS+=" --trust-remote-code"
-[ -n "${DTYPE:-}" ]                    && APP_ARGS+=" --dtype $DTYPE"
-[ -n "${KV_CACHE_DTYPE:-}" ]          && APP_ARGS+=" --kv-cache-dtype $KV_CACHE_DTYPE"
-[ -n "${QUANTIZATION:-}" ]            && APP_ARGS+=" --quantization $QUANTIZATION"
-[ -n "${QUANTIZATION_PARAM_PATH:-}" ] && APP_ARGS+=" --quantization-param-path $QUANTIZATION_PARAM_PATH"
-[ -n "${GPU_MEMORY_UTILIZATION:-}" ]  && APP_ARGS+=" --gpu-memory-utilization $GPU_MEMORY_UTILIZATION"
-[ "${ENABLE_CHUNKED_PREFILL:-}" = true ] && APP_ARGS+=" --enable-chunked-prefill"
-[ -n "${BLOCK_SIZE:-}" ]              && APP_ARGS+=" --block-size $BLOCK_SIZE"
-[ -n "${MAX_NUM_SEQS:-}" ]            && APP_ARGS+=" --max-num-seqs $MAX_NUM_SEQS"
-[ -n "${SEED:-}" ]                    && APP_ARGS+=" --seed $SEED"
-[ "${ENABLE_EXPERT_PARALLEL:-}" = true ] && APP_ARGS+=" --enable-expert-parallel"
-[ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]  && APP_ARGS+=" --max-num-batched-tokens $MAX_NUM_BATCHED_TOKENS"
-[ "${ENABLE_PREFIX_CACHING:-}" = true ] && APP_ARGS+=" --enable-prefix-caching"
-[ -n "${HOST:-}" ]                    && APP_ARGS+=" --host $HOST"
-[ -n "${PROXY_PORT:-}" ]              && APP_ARGS+=" --port $PROXY_PORT"
-[ -n "${INPUT_LENGTH:-}" ]            && APP_ARGS+=" --input-length $INPUT_LENGTH"
-[ -n "${OUTPUT_LENGTH:-}" ]           && APP_ARGS+=" --output-length $OUTPUT_LENGTH"
-[ -n "${CONFIG_FILE:-}" ]             && APP_ARGS+=" --config-file $CONFIG_FILE"
-[ "${DISTRIBUTED:-}" = true ]         && APP_ARGS+=" --distributed"
-[ -n "${GPU_USAGE_MODE:-}" ]          && APP_ARGS+=" --gpu-usage-mode $GPU_USAGE_MODE"
-[ -n "${DEVICE_COUNT:-}" ]            && APP_ARGS+=" --device-count $DEVICE_COUNT"
-[ -n "${MODEL_TYPE:-}" ]              && APP_ARGS+=" --model-type $MODEL_TYPE"
-[ "${ENABLE_SPECULATIVE_DECODE:-}" = true ] && APP_ARGS+=" --enable-speculative-decode"
-[ -n "${SPECULATIVE_DECODE_MODEL_PATH:-}" ] && APP_ARGS+=" --speculative-decode-model-path $SPECULATIVE_DECODE_MODEL_PATH"
-[ "${ENABLE_RAG_ACC:-}" = true ]      && APP_ARGS+=" --enable-rag-acc"
-[ "${ENABLE_AUTO_TOOL_CHOICE:-}" = true ] && APP_ARGS+=" --enable-auto-tool-choice"
+[ -n "${SAVE_PATH:-}" ]               && APP_ARGS+=("--save-path" "$SAVE_PATH")
+[ -n "${ENGINE:-}" ]                   && APP_ARGS+=("--engine" "$ENGINE")
+[ "${TRUST_REMOTE_CODE:-}" = true ]    && APP_ARGS+=("--trust-remote-code")
+[ -n "${DTYPE:-}" ]                    && APP_ARGS+=("--dtype" "$DTYPE")
+[ -n "${KV_CACHE_DTYPE:-}" ]          && APP_ARGS+=("--kv-cache-dtype" "$KV_CACHE_DTYPE")
+[ -n "${QUANTIZATION:-}" ]            && APP_ARGS+=("--quantization" "$QUANTIZATION")
+[ -n "${QUANTIZATION_PARAM_PATH:-}" ] && APP_ARGS+=("--quantization-param-path" "$QUANTIZATION_PARAM_PATH")
+[ -n "${GPU_MEMORY_UTILIZATION:-}" ]  && APP_ARGS+=("--gpu-memory-utilization" "$GPU_MEMORY_UTILIZATION")
+[ "${ENABLE_CHUNKED_PREFILL:-}" = true ] && APP_ARGS+=("--enable-chunked-prefill")
+[ -n "${BLOCK_SIZE:-}" ]              && APP_ARGS+=("--block-size" "$BLOCK_SIZE")
+[ -n "${MAX_NUM_SEQS:-}" ]            && APP_ARGS+=("--max-num-seqs" "$MAX_NUM_SEQS")
+[ -n "${SEED:-}" ]                    && APP_ARGS+=("--seed" "$SEED")
+[ "${ENABLE_EXPERT_PARALLEL:-}" = true ] && APP_ARGS+=("--enable-expert-parallel")
+[ -n "${MAX_NUM_BATCHED_TOKENS:-}" ]  && APP_ARGS+=("--max-num-batched-tokens" "$MAX_NUM_BATCHED_TOKENS")
+[ "${ENABLE_PREFIX_CACHING:-}" = true ] && APP_ARGS+=("--enable-prefix-caching")
+[ -n "${HOST:-}" ]                    && APP_ARGS+=("--host" "$HOST")
+[ -n "${PROXY_PORT:-}" ]              && APP_ARGS+=("--port" "$PROXY_PORT")
+[ -n "${INPUT_LENGTH:-}" ]            && APP_ARGS+=("--input-length" "$INPUT_LENGTH")
+[ -n "${OUTPUT_LENGTH:-}" ]           && APP_ARGS+=("--output-length" "$OUTPUT_LENGTH")
+[ -n "${CONFIG_FILE:-}" ]             && APP_ARGS+=("--config-file" "$CONFIG_FILE")
+[ "${DISTRIBUTED:-}" = true ]         && APP_ARGS+=("--distributed")
+[ -n "${GPU_USAGE_MODE:-}" ]          && APP_ARGS+=("--gpu-usage-mode" "$GPU_USAGE_MODE")
+[ -n "${DEVICE_COUNT:-}" ]            && APP_ARGS+=("--device-count" "$DEVICE_COUNT")
+[ -n "${MODEL_TYPE:-}" ]              && APP_ARGS+=("--model-type" "$MODEL_TYPE")
+[ "${ENABLE_SPECULATIVE_DECODE:-}" = true ] && APP_ARGS+=("--enable-speculative-decode")
+[ -n "${SPECULATIVE_DECODE_MODEL_PATH:-}" ] && APP_ARGS+=("--speculative-decode-model-path" "$SPECULATIVE_DECODE_MODEL_PATH")
+[ "${ENABLE_RAG_ACC:-}" = true ]      && APP_ARGS+=("--enable-rag-acc")
+[ "${ENABLE_AUTO_TOOL_CHOICE:-}" = true ] && APP_ARGS+=("--enable-auto-tool-choice")
 
 
 # ===== 进入工作目录 =====
@@ -357,7 +358,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 # B 启动 app.main，它内部自动管理 proxy + health 两个子进程，
 # 并将引擎启动脚本写入共享卷（由另一个容器执行）。
 #
-echo "Starting wings application (sidecar launcher) with args: $APP_ARGS"
+echo "Starting wings application (sidecar launcher) with args: ${APP_ARGS[*]}"
 
 # 记录新功能启用状态
 [ "${ENABLE_SPECULATIVE_DECODE:-}" = true ] && echo "Speculative decode feature enabled"
@@ -373,4 +374,4 @@ echo "Enable proxy: ${ENABLE_REASON_PROXY}"
 #   2. 启动 proxy (uvicorn :18000) 和 health (uvicorn :19000) 子进程
 #   3. 进入守护循环，自动重启崩溃的子进程
 #   4. 收到 SIGTERM/SIGINT 后优雅退出所有子进程
-exec "${PYTHON_BIN}" -m app.main $APP_ARGS
+exec "${PYTHON_BIN}" -m app.main "${APP_ARGS[@]}"

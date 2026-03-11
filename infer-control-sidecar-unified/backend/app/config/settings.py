@@ -12,31 +12,10 @@
 核心设计要点：
   - 所有端口、路径都通过环境变量驱动，便于 K8s 动态配置
   - Settings 类在模块级别实例化为单例 `settings`，进程内全局唯一
-  - 布尔环境变量统一用 _env_bool() 解析，支持 1/true/yes/on 等格式
+  - pydantic-settings 自动将字段名映射为同名环境变量，支持类型转换
 """
 
-import os
-
 from pydantic_settings import BaseSettings
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    """统一解析布尔环境变量。
-
-    支持的真值字符串: '1', 'true', 'yes', 'on'（大小写不敏感）。
-    当环境变量不存在时返回 default 默认值。
-
-    Args:
-        name: 环境变量名称
-        default: 环境变量不存在时的默认返回值
-
-    Returns:
-        bool: 解析后的布尔值
-    """
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class Settings(BaseSettings):
@@ -53,56 +32,59 @@ class Settings(BaseSettings):
     所有参数均通过环境变量驱动，支持 K8s ConfigMap/Secret 注入，
     同时通过 pydantic-settings 自动加载 .env 文件用于本地开发。
     本类在模块级别实例化为单例 ``settings``，进程内全局唯一。
+
+    注意：pydantic-settings 会自动将字段名映射为同名环境变量读取，
+    因此不需要手动调用 os.getenv()。字段默认值即为环境变量不存在时的回退值。
     """
     # 共享卷路径：launcher 在这里写 start_command.sh，engine 容器在这里读取。
-    SHARED_VOLUME_PATH: str = os.getenv("SHARED_VOLUME_PATH", "/shared-volume")
-    START_COMMAND_FILENAME: str = os.getenv("START_COMMAND_FILENAME", "start_command.sh")
+    SHARED_VOLUME_PATH: str = "/shared-volume"
+    START_COMMAND_FILENAME: str = "start_command.sh"
 
     # 引擎基础配置。ENGINE_PORT 是 backend 真实监听端口，不是对外代理端口。
-    ENGINE_TYPE: str = os.getenv("ENGINE_TYPE", "vllm")
-    ENGINE_HOST: str = os.getenv("ENGINE_HOST", "127.0.0.1")
-    ENGINE_PORT: int = int(os.getenv("ENGINE_PORT", "17000"))
-    ENABLE_REASON_PROXY: bool = _env_bool("ENABLE_REASON_PROXY", True)
+    ENGINE_TYPE: str = "vllm"
+    ENGINE_HOST: str = "127.0.0.1"
+    ENGINE_PORT: int = 17000
+    ENABLE_REASON_PROXY: bool = True
 
     # sidecar 三层端口：
     # - backend: engine 真正服务端口
     # - proxy:   对外 API 端口
     # - health:  专用健康检查端口
-    PORT: int = int(os.getenv("PORT", "18000"))
-    HEALTH_PORT: int = int(os.getenv("HEALTH_PORT", "19000"))
-    WINGS_PORT: int = int(os.getenv("WINGS_PORT", "9000"))  # legacy field
+    PORT: int = 18000
+    HEALTH_PORT: int = 19000
+    WINGS_PORT: int = 9000  # legacy field
 
     # 子服务启动入口。launcher 会调用 `python -m uvicorn <app>` 启动对应服务。
-    PYTHON_BIN: str = os.getenv("PYTHON_BIN", "python")
-    UVICORN_MODULE: str = os.getenv("UVICORN_MODULE", "uvicorn")
-    PROXY_APP: str = os.getenv("PROXY_APP", "app.proxy.gateway:app")
-    HEALTH_APP: str = os.getenv("HEALTH_APP", "app.proxy.health_service:app")
-    PROCESS_POLL_SEC: float = float(os.getenv("PROCESS_POLL_SEC", "1.0"))
+    PYTHON_BIN: str = "python"
+    UVICORN_MODULE: str = "uvicorn"
+    PROXY_APP: str = "app.proxy.gateway:app"
+    HEALTH_APP: str = "app.proxy.health_service:app"
+    PROCESS_POLL_SEC: float = 1.0
 
     # 与历史 wings_start 语义兼容的模型默认参数。
-    MODEL_NAME: str = os.getenv("MODEL_NAME", "")
-    MODEL_PATH: str = os.getenv("MODEL_PATH", "/weights")
-    SAVE_PATH: str = os.getenv("SAVE_PATH", "/opt/wings/outputs")
-    TP_SIZE: int = int(os.getenv("TP_SIZE", "1"))
-    MAX_MODEL_LEN: int = int(os.getenv("MAX_MODEL_LEN", "4096"))
+    MODEL_NAME: str = ""
+    MODEL_PATH: str = "/weights"
+    SAVE_PATH: str = "/opt/wings/outputs"
+    TP_SIZE: int = 1
+    MAX_MODEL_LEN: int = 4096
 
     # ---- 分布式模式配置 ----
     # 这些字段由 _determine_role() 使用，控制 Master/Worker 模式分支。
     # K8s 仅需注入 DISTRIBUTED=true、MASTER_IP 和 NODE_IPS（逗号分隔），
     # 其余分布式参数（nnodes/node_rank/head_node_addr）由 Master 动态计算注入。
-    DISTRIBUTED: bool = _env_bool("DISTRIBUTED", False)
-    MASTER_IP: str = os.getenv("MASTER_IP", "")
-    NODE_IPS: str = os.getenv("NODE_IPS", "")  # 逗号分隔的所有节点 IP
+    DISTRIBUTED: bool = False
+    MASTER_IP: str = ""
+    NODE_IPS: str = ""  # 逗号分隔的所有节点 IP
 
     # ---- 历史兼容字段 ----
     # 这些字段在 v4 架构中已不再是核心配置，但仍被部分旧版部署模板
     # 和 legacy wings_start.sh 脚本引用，因此保留以保证向后兼容。
-    HEALTH_CHECK_INTERVAL: int = int(os.getenv("HEALTH_CHECK_INTERVAL", "5"))  # 健康检查间隔（秒）
-    HEALTH_CHECK_TIMEOUT: int = int(os.getenv("HEALTH_CHECK_TIMEOUT", "300"))  # 健康检查超时（秒）
-    SERVICE_CLUSTER_IP: str = os.getenv("SERVICE_CLUSTER_IP", "")  # K8s Service ClusterIP（可选）
-    NODE_PORT: str = os.getenv("NODE_PORT", "30483")  # K8s NodePort 端口号
-    NODE_IP: str = os.getenv("NODE_IP", "")  # 当前宿主机 IP
-    ENABLE_ACCEL: bool = _env_bool("ENABLE_ACCEL", False)  # 是否启用 Accel 加速包（注入 WINGS_ENGINE_PATCH_OPTIONS）
+    HEALTH_CHECK_INTERVAL: int = 5  # 健康检查间隔（秒）
+    HEALTH_CHECK_TIMEOUT: int = 300  # 健康检查超时（秒）
+    SERVICE_CLUSTER_IP: str = ""  # K8s Service ClusterIP（可选）
+    NODE_PORT: str = "30483"  # K8s NodePort 端口号
+    NODE_IP: str = ""  # 当前宿主机 IP
+    ENABLE_ACCEL: bool = False  # 是否启用 Accel 加速包（注入 WINGS_ENGINE_PATCH_OPTIONS）
 
     class Config:
         """pydantic-settings 配置类：启用 .env 文件自动加载。"""

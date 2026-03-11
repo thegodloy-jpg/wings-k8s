@@ -176,7 +176,7 @@ async def _close_resp_quiet(resp: httpx.Response) -> None:
     try:
         await resp.aclose()
     except Exception as e:
-        C.logger.error(f"Failed to close response: {e}")
+        C.logger.error("Failed to close response: %s", e)
 
 
 def _mark_retry_count(resp: httpx.Response, attempt: int) -> None:
@@ -192,7 +192,7 @@ def _mark_retry_count(resp: httpx.Response, attempt: int) -> None:
     try:
         resp.extensions["app_retry_count"] = attempt - 1
     except Exception as e:
-        C.logger.error(f"Failed to set retry count in response extensions: {e}")
+        C.logger.error("Failed to set retry count in response extensions: %s", e)
 
 
 async def _log_and_wait_status_retry(rid: str | None, attempt: int, status: int, interval: float, t0: float) -> None:

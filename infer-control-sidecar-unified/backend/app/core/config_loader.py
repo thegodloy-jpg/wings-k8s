@@ -123,7 +123,7 @@ def _check_vram_requirements(weight_path: str, hardware_env: Dict[str, Any], nod
         nodes_count:  分布式节点总数，用于计算跨节点总显存
     """
     if not os.path.exists(weight_path):
-        logger.warning(f"Model weight path not found: {weight_path}")
+        logger.warning("Model weight path not found: %s", weight_path)
         return
 
     weight_size_bytes = get_directory_size(weight_path)
@@ -311,7 +311,7 @@ def _set_cuda_graph_sizes(params, ctx, model_info):
         max_num_batch_sizes = max(min(max_num_batch_sizes, len(cudagraph_capture_sizes)), 1)
         cuda_graph_sizes = cudagraph_capture_sizes[max_num_batch_sizes - 1]
         params["cuda_graph_sizes"] = cuda_graph_sizes
-        logger.info(f"cuda-graph-sizes is set by {cuda_graph_sizes}")
+        logger.info("cuda-graph-sizes is set by %s", cuda_graph_sizes)
 
 
 def _set_operator_acceleration(params, ctx):
@@ -433,14 +433,14 @@ def _get_pd_config(ctx, pd_role):
             "kv_port": os.getenv("PD_KV_PORT", "20001"),
             "kv_connector_module_path": "vllm_ascend.distributed.llmdatadist_c_mgr_connector"
         }
-        logger.info(f"[PD Config] Ascend device detected, role={pd_role}, kv_role={kv_role}")
+        logger.info("[PD Config] Ascend device detected, role=%s, kv_role=%s", pd_role, kv_role)
     else:
         # AscendPD
         config = {
             "kv_connector": "NixlConnector",
             "kv_role": "kv_both"
         }
-        logger.info(f"[PD Config] non-ascend device ({device}) detected, role={pd_role}")
+        logger.info("[PD Config] non-ascend device (%s) detected, role=%s", device, pd_role)
 
     return config
 
@@ -468,16 +468,16 @@ def _set_kv_cache_config(params, ctx):
                 ]
             }
         }
-        logger.info(f"[KVCache Offload] KVCache Offload feature is enabled and PD role is {pd_role}")
+        logger.info("[KVCache Offload] KVCache Offload feature is enabled and PD role is %s", pd_role)
     elif lmcache_offload:
         config = {
             "kv_connector": 'LMCacheConnectorV1',
             "kv_role": "kv_both"
         }
-        logger.info(f"[KVCache Offload] KVCache Offload feature is enabled")
+        logger.info("[KVCache Offload] KVCache Offload feature is enabled")
     elif pd_role:
         config = _get_pd_config(ctx, pd_role)
-        logger.info(f"PD role is {pd_role}")
+        logger.info("PD role is %s", pd_role)
     else:
         return  #
 
@@ -507,7 +507,7 @@ def _set_router_config(params):
     })
 
     params['kv_events_config'] = kv_events_config
-    logger.info(f"Wings Router for vllm is enabled")
+    logger.info("Wings Router for vllm is enabled")
 
 
 def _merge_mindie_params(params, ctx, engine_cmd_parameter):
@@ -697,7 +697,7 @@ def _load_default_config(hardware_env: Dict[str, Any]) -> Dict[str, Any]:
         if os.path.exists(legacy_path):
             logger.warning("Fallback to legacy default config: %s", legacy_path)
             default_config_path = legacy_path
-    logger.info(f"Determined default config file for hardware environment '{device_type}': {default_config_path}")
+    logger.info("Determined default config file for hardware environment '%s': %s", device_type, default_config_path)
     config = load_json_config(default_config_path)
 
     # 兼容旧版：若主配置缺少 model_deploy_config，尝试从旧版设备配置文件中补充
@@ -759,10 +759,10 @@ def _load_user_config(config) -> Dict[str, Any]:
             logger.info("The config-file is not JSON string, will load it as a file")
     elif os.path.exists(config):
         #
-        logger.info(f"Loading user-specified config file: {config}")
+        logger.info("Loading user-specified config file: %s", config)
         user_config = load_json_config(config)
     else:
-        logger.warning(f"User-specified config not found or invalid: {config}")
+        logger.warning("User-specified config not found or invalid: %s", config)
 
     return user_config
 
@@ -852,7 +852,7 @@ def _auto_select_engine(hardware_env: Dict[str, Any],
                 logger.info("The permission setting for model config.json is not set to 640. " \
                 "Since MindIE only supports the 640 permission configuration, we will adjust it to 640.")
             except Exception as e:
-                logger.warning(f"Failed to set permission for model config.json to 640: {e}.")
+                logger.warning("Failed to set permission for model config.json to 640: %s.", e)
         if "310" in device_name:
             check_torch_dtype(config_json_file)
 
@@ -866,7 +866,7 @@ def _auto_select_engine(hardware_env: Dict[str, Any],
 
     # 将 engine 写入全局环境变量，供 gateway.py 等其他模块读取
     os.environ['WINGS_ENGINE'] = engine
-    logger.info(f"Set global environment variable WINGS_ENGINE={engine}")
+    logger.info("Set global environment variable WINGS_ENGINE=%s", engine)
 
     # 在昇腾设备上将 vllm 自动升级为 vllm_ascend
     if engine == "vllm":
@@ -934,17 +934,17 @@ def _select_nvidia_engine(gpu_usage_mode: str, model_info) -> str:
         logger.info("Device is Mig, automatically switched to VLLM engine")
         return vllm
     elif model_type in ["embedding", "rerank", "mmum"]:
-        logger.info(f"model type is {model_type}, automatically switched to VLLM engine")
+        logger.info("model type is %s, automatically switched to VLLM engine", model_type)
         return vllm
     elif model_type == "mmgm":
-        logger.info(f"model type is {model_type}, automatically switched to wings engine")
+        logger.info("model type is %s, automatically switched to wings engine", model_type)
         return 'wings'
     elif is_wings_supported:
         logger.info("No engine specified, automatically selected engine: sglang")
         return 'sglang'
     else:
-        logger.warning(f"This model architecture {model_architecture} has not been validated on Wings."
-                       "automatically switched to VLLM engine")
+        logger.warning("This model architecture %s has not been validated on Wings. "
+                       "automatically switched to VLLM engine", model_architecture)
         return vllm
 
 
@@ -981,14 +981,14 @@ def _select_ascend_engine(device_name: str, model_info) -> str:
         logger.info("Ascend310 not support vllm ascend, automatically selected engine: mindie")
         return 'mindie'
     elif model_type in ["embedding", "rerank"]:
-        logger.info(f"model type is {model_type}, automatically switched to VLLM engine")
+        logger.info("model type is %s, automatically switched to VLLM engine", model_type)
         return "vllm_ascend"
     elif model_type == "mmgm":
-        logger.info(f"model type is {model_type}, automatically switched to wings engine")
+        logger.info("model type is %s, automatically switched to wings engine", model_type)
         return 'wings'
     elif get_operator_acceleration_env():
-        logger.warning(f"operator_acceleration is enabled,\
-                        automatically switched to VLLM_Ascend engine")
+        logger.warning("operator_acceleration is enabled, "
+                       "automatically switched to VLLM_Ascend engine")
         return "vllm_ascend"
     elif get_lmcache_env():
         logger.info("[KVCache Offload] KVCache Offload enabled, automatically switched to VLLM_Ascend engine")
@@ -997,15 +997,15 @@ def _select_ascend_engine(device_name: str, model_info) -> str:
         logger.info("Wings router enabled, automatically switched to VLLM engine")
         return "vllm_ascend"
     elif get_soft_fp8_env():
-        logger.warning(f"soft fp8 is enabled, "
+        logger.warning("soft fp8 is enabled, "
                        "automatically switched to VLLM_Ascend engine")
         return "vllm_ascend"
     elif is_wings_supported:
         logger.info("No engine specified, automatically selected engine: mindie")
         return 'mindie'
     else:
-        logger.warning(f"This model architecture {model_architecture} has not been validated on Wings."
-                       "automatically switched to VLLM_Ascend engine")
+        logger.warning("This model architecture %s has not been validated on Wings. "
+                       "automatically switched to VLLM_Ascend engine", model_architecture)
         return "vllm_ascend"
 
 
@@ -1041,15 +1041,15 @@ def _validate_user_engine(engine: str, device_name: str, gpu_usage_mode: str, mo
             return "vllm_ascend"
         # embeddingrerankvllm_ascend
         elif model_type in ["embedding", "rerank"]:
-            logger.warning(f"model type is {model_type}, automatically switched to VLLM_Ascend engine")
+            logger.warning("model type is %s, automatically switched to VLLM_Ascend engine", model_type)
             return "vllm_ascend"
         elif get_router_env():
             logger.warning("Wings router enabled, automatically switched to VLLM engine")
             return vllm
         # QwenQwQvllm_ascend
         elif get_operator_acceleration_env():
-            logger.warning(f"operator_acceleration is enabled, \
-                            automatically switched to VLLM_Ascend engine")
+            logger.warning("operator_acceleration is enabled, "
+                           "automatically switched to VLLM_Ascend engine")
             return "vllm_ascend"
     elif engine == 'sglang':
         if get_lmcache_env():
@@ -1065,7 +1065,7 @@ def _validate_user_engine(engine: str, device_name: str, gpu_usage_mode: str, mo
             logger.warning("Device is Mig, automatically switched to VLLM engine")
             return vllm
         elif model_type in ["embedding", "rerank"]:
-            logger.warning(f"model type is {model_type}, automatically switched to VLLM engine")
+            logger.warning("model type is %s, automatically switched to VLLM engine", model_type)
             return vllm
     return engine
 
@@ -1249,19 +1249,19 @@ def _get_model_specific_config(hardware_env: Dict[str, Any],
 
             if is_deepseek_sglang_nvidia and h20_model in ["H20-96G", "H20-141G"]:
                 engine_specific_defaults = config.get(engine_key, {}).get(h20_model, {})
-                logger.info(f"Using dedicated config for model '{model_name}' on {h20_model}")
+                logger.info("Using dedicated config for model '%s' on %s", model_name, h20_model)
             elif not is_deepseek_sglang_nvidia:
                 engine_specific_defaults = config.get(engine_key, {})
-                logger.info(f"The default deploy configuration "
-                            f"of the model architecture {model_architecture} will be used.")
+                logger.info("The default deploy configuration "
+                            "of the model architecture %s will be used.", model_architecture)
             break
         if not engine_specific_defaults:
-            logger.info(f"The default deploy configuration of the "
-                        f"model architecture {model_architecture} will be used.")
+            logger.info("The default deploy configuration of the "
+                        "model architecture %s will be used.", model_architecture)
             engine_specific_defaults = model_architecture_dict.get(default_key, {}).get(engine_key, {})
     else:
         engine_specific_defaults = models_dict.get(default_key, {}).get(engine_key, {})
-        logger.info(f"The default deploy configuration of the model type {model_type} will be used.")
+        logger.info("The default deploy configuration of the model type %s will be used.", model_type)
 
     engine_specific_defaults = _merge_cmd_params(hardware_env, engine_specific_defaults, cmd_known_params, model_info)
     return engine_specific_defaults
@@ -1608,5 +1608,5 @@ def load_and_merge_configs(
     final_engine_params = _merge_final_config(engine_config, cmd_known_params)
 
 
-    logger.info(f"Config merging completed.")
+    logger.info("Config merging completed.")
     return final_engine_params

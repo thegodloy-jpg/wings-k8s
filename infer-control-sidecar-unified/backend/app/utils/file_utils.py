@@ -77,7 +77,7 @@ def safe_write_file(file_path: str,
                 f.write(content)
         return True
     except Exception as e:
-        logger.error(f"Failed to write file {file_path}: {e}", exc_info=True)
+        logger.error("Failed to write file %s: %s", file_path, e, exc_info=True)
         return False
 
 
@@ -116,13 +116,13 @@ def check_permission_640(file_path):
             return False
 
     except FileNotFoundError:
-        logger.error(f"Error: File '{file_path}' does not exist")
+        logger.error("Error: File '%s' does not exist", file_path)
         raise
     except PermissionError:
-        logger.error(f"Error: No permission to access file '{file_path}'")
+        logger.error("Error: No permission to access file '%s'", file_path)
         raise
     except OSError as e:
-        logger.error(f"OS error occurred while checking permissions: {e}")
+        logger.error("OS error occurred while checking permissions: %s", e)
         raise OSError(f"Failed to check file permissions: {e}") from e
 
 
@@ -155,16 +155,16 @@ def check_torch_dtype(json_file_path):
         return True
 
     except FileNotFoundError:
-        logger.error(f"The file {json_file_path} was not found")
+        logger.error("The file %s was not found", json_file_path)
         raise
     except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON format in file: {e}")
+        logger.error("Invalid JSON format in file: %s", e)
         raise
     except IOError as e:
-        logger.error(f"An error occurred while reading the file: {e}")
+        logger.error("An error occurred while reading the file: %s", e)
         raise
     except Exception as e:
-        logger.error(f"Unexpected error checking torch dtype: {e}")
+        logger.error("Unexpected error checking torch dtype: %s", e)
         raise RuntimeError(f"Failed to check torch dtype: {e}") from e
 
 
@@ -179,16 +179,16 @@ def load_json_config(file_path: str) -> Dict[str, Any]:
         Dict[str, Any]:
     """
     if not os.path.exists(file_path):
-        logger.warning(f"Config file not found: {file_path}")
+        logger.warning("Config file not found: %s", file_path)
         return {}
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             config_data = json.load(f)
-            logger.info(f"Successfully loaded config file: {file_path}")
+            logger.info("Successfully loaded config file: %s", file_path)
             return config_data
     except json.JSONDecodeError:
-        logger.error(f"Failed to parse JSON config file: {file_path}", exc_info=True)
+        logger.error("Failed to parse JSON config file: %s", file_path, exc_info=True)
         return {}
     except Exception:
-        logger.error(f"Unknown error loading config file: {file_path}", exc_info=True)
+        logger.error("Unknown error loading config file: %s", file_path, exc_info=True)
         return {}

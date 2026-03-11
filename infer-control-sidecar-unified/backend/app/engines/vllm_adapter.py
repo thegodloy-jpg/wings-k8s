@@ -52,6 +52,7 @@ vLLM 引擎适配器。
 import logging
 import os
 import re
+import shlex
 from typing import Dict, Any, List
 
 from app.utils.model_utils import ModelIdentifier
@@ -61,22 +62,18 @@ from app.utils.env_utils import get_local_ip, get_lmcache_env, \
 
 
 def _sanitize_shell_path(path: str) -> str:
-    """从文件路径中移除 shell 元字符，防止命令注入攻击。
+    """对路径进行 shell 安全转义，防止命令注入攻击。
 
-    安全考量：当路径来自用户输入或环境变量时，可能包含
-    特殊字符（如 $, `, ;）导致命令注入。本函数仅保留安全字符。
+    使用 shlex.quote() 进行标准 POSIX shell 转义，
+    相比简单的正则过滤更安全且不会破坏包含空格的合法路径。
 
     Args:
         path: 原始文件路径字符串
 
     Returns:
-        str: 仅包含字母、数字、下划线、斜杠、点、横线的安全路径
-
-    示例:
-        >>> _sanitize_shell_path("/opt/model; rm -rf /")
-        '/opt/model rm -rf '
+        str: 经过 shell 安全转义的路径
     """
-    return re.sub(r"[^a-zA-Z0-9/_.-]", "", path)
+    return shlex.quote(path)
 
 logger = logging.getLogger(__name__)
 
@@ -153,12 +150,14 @@ def _build_cache_env_commands(engine: str) -> List[str]:
     if engine == "vllm":
         #  kv_agent
         lib_path = _sanitize_shell_path(os.getenv("KV_AGENT_LIB_PATH", "/opt/vllm_env/lib/python3.10/site-packages/kv_agent/lib"))
-        env_commands.append(f'export LD_LIBRARY_PATH="{lib_path}:$LD_LIBRARY_PATH"')
+        env_commands.append(f'_KV_LIB_PATH={lib_path}')
+        env_commands.append('export LD_LIBRARY_PATH="${_KV_LIB_PATH}:${LD_LIBRARY_PATH:-}"')
         logger.info("[KVCache Offload] Added LD_LIBRARY_PATH for vllm: %s", lib_path)
     elif engine == "vllm_ascend":
         #  lmcache
         lib_path = _sanitize_shell_path(os.getenv("LMCACHE_LIB_PATH", "/opt/ascend_env/lib/python3.11/site-packages/lmcache"))
-        env_commands.append(f'export LD_LIBRARY_PATH="{lib_path}:$LD_LIBRARY_PATH"')
+        env_commands.append(f'_LMCACHE_LIB_PATH={lib_path}')
+        env_commands.append('export LD_LIBRARY_PATH="${_LMCACHE_LIB_PATH}:${LD_LIBRARY_PATH:-}"')
         logger.info("[KVCache Offload] Added LD_LIBRARY_PATH for vllm_ascend: %s", lib_path)
 
     return env_commands
@@ -191,8 +190,8 @@ def _build_qat_env_commands(engine) -> List[str]:
         env_commands.append('export LMCACHE_QAT_ENABLED=True')
     else:
         env_commands.append('export LMCACHE_QAT_ENABLED=False')
-        logger.warning(f"[KVCache Offload] QAT compression feature is not supported by the current engine {engine}, "
-                       "it has been automatically disabled")
+        logger.warning("[KVCache Offload] QAT compression feature is not supported by the current engine %s, "
+                       "it has been automatically disabled", engine)
     return env_commands
 
 

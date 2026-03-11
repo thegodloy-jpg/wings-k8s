@@ -79,7 +79,7 @@ def wait_for_process_startup(
     #
     while True:
         if started.is_set():
-            _logger.info(f"Detected service startup success message: {success_message}")
+            _logger.info("Detected service startup success message: %s", success_message)
             return True
 
         if process.poll() is not None:  #
@@ -133,7 +133,7 @@ def log_process_pid(
 
         logger.info(log_msg)
     except Exception as e:
-        logger.error(f"Failed to log PID: {e}", exc_info=True)
+        logger.error("Failed to log PID: %s", e, exc_info=True)
         raise
 
 
@@ -158,7 +158,7 @@ def log_stream(process):
                 if line.strip():
                     logger.error(line.strip())
         except Exception as e:
-            logger.error(f"Log stream error: {e}")
+            logger.error("Log stream error: %s", e)
         finally:
             logger.info("Service log stream ended")
 
