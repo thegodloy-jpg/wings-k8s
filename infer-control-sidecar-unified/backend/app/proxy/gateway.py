@@ -74,6 +74,10 @@ from .health import (
     build_health_headers,
 )
 
+# RAG 加速 — 从 v2 迁移
+from app.proxy.rag_acc.rag_app import is_rag_scenario, rag_acc_chat
+from app.proxy.rag_acc.extract_dify_info import is_dify_scenario, extract_dify_info
+
 configure_worker_logging()
 
 # =============================================================================
@@ -879,6 +883,42 @@ async def _forward_stream(req: Request, upstream_path: str):
 FORCE_TOPK_TOPP = want_topk("WINGS_FORCE_CHAT_TOPK_TOPP", "1")  #
 
 
+async def handle_rag_scenario(req: Request, upstream_path: str):
+    """处理 RAG 加速场景的流式请求（v2 新增功能）。
+
+    当 RAG_ACC_ENABLED 为 true 时，检测请求是否匹配 RAG / Dify 场景，
+    若匹配则走 Map-Reduce 加速路径，否则回退到普通流式转发。
+    """
+    from fastchat.protocol.openai_api_protocol import ChatCompletionRequest
+
+    body = await req.body()
+    rid = req.headers.get("x-request-id")
+
+    # 强制跳过
+    if b"/no_rag_acc" in body:
+        jlog("rag acceleration skipped forcibly", rid=rid)
+        return await _forward_stream(req, upstream_path)
+
+    # 解析请求体为 ChatCompletionRequest
+    try:
+        import json as _json
+        payload_dict = _json.loads(body)
+        chat_input = ChatCompletionRequest(**payload_dict)
+    except Exception as e:
+        elog("rag_parse_error", rid=rid, detail=str(e))
+        return await _forward_stream(req, upstream_path)
+
+    # 非 RAG 请求
+    is_rag = is_rag_scenario(chat_input, req)
+    is_dify = is_dify_scenario(chat_input)
+    if not is_rag and not is_dify:
+        jlog("not rag and dify scenario", rid=rid)
+        return await _forward_stream(req, upstream_path)
+
+    jlog("rag acceleration enabled", rid=rid, backend=C.BACKEND_URL)
+    return await rag_acc_chat(chat_input, request=req, backend_url=C.BACKEND_URL + upstream_path)
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
     """聊天补全接口，根据 `stream` 字段自动切换转发路径。"""
@@ -896,6 +936,9 @@ async def chat_completions(req: Request):
         req = rebuild_request_json(req, payload)
 
     if want_stream(payload.get("stream", False)):
+        # RAG 加速场景拦截（v2 新增）
+        if C.RAG_ACC_ENABLED:
+            return await handle_rag_scenario(req, "/v1/chat/completions")
         return await _forward_stream(req, "/v1/chat/completions")
     return await _forward_nonstream(req, "/v1/chat/completions")
 
@@ -1033,6 +1076,59 @@ async def hv_text2video_status(task_id: str, req: Request):
         media_type=r.headers.get("content-type", "application/json"),
         headers=entity_headers,
     )
+
+
+# -----------------------------
+# Image: 文生图提交 (v2 新增)
+# -----------------------------
+@app.post("/v1/images/text2image")
+async def img_text2image(req: Request):
+    """
+    Qwen-Image 文生图提交：
+    直接非流式透传到后端 /v1/images/text2image
+    """
+    return await _forward_nonstream(req, "/v1/images/text2image")
+
+
+# -----------------------------
+# Image: 文生图任务状态查询 (v2 新增)
+# -----------------------------
+@app.get("/v1/images/text2image/{task_id}")
+async def img_text2image_status(task_id: str, req: Request):
+    """
+    Qwen-Image 文生图任务状态查询：
+    透传到后端 /v1/images/text2image/{task_id} 并返回其响应。
+    """
+    client: httpx.AsyncClient = app.state.client
+    rid = req.headers.get("x-request-id")
+    url = build_backend_url(f"/v1/images/text2image/{task_id}")
+
+    r = await _send_with_fixed_retries(
+        client,
+        "GET",
+        url,
+        headers=make_upstream_headers(req, want_gzip=False),
+        stream=True,
+        timeout=httpx.Timeout(
+            connect=C.STATUS_CONNECT_TIMEOUT,
+            read=C.STATUS_READ_TIMEOUT,
+            write=C.HTTPX_WRITE_TIMEOUT,
+            pool=C.HTTPX_POOL_TIMEOUT,
+        ),
+        rid=rid,
+    )
+
+    entity_headers = _copy_entity_headers(r)
+    data = await r.aread()
+    await r.aclose()
+
+    return Response(
+        data,
+        status_code=r.status_code,
+        media_type=r.headers.get("content-type", "application/json"),
+        headers=entity_headers,
+    )
+
 
 # `/health` 返回的是 health 状态机的当前快照，而不是现场临时探测。
 

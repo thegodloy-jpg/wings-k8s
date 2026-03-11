@@ -73,16 +73,16 @@ spec:
         - name: DISTRIBUTED
           value: "true"
         - name: MASTER_IP
-          # head 绑定 bridge IP 172.17.0.3；.148 物理机 iptables DNAT: 7.6.52.148:13355 → 172.17.0.3:13355
-          value: "172.17.0.3"
+          # 必须与 head 的 RANK_IP（status.podIP）一致，用于角色判定。
+          # hostNetwork=true 时 podIP = 宿主机 IP。
+          value: "7.6.52.148"
         - name: RANK_IP
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
         - name: NODE_IPS
-          # 仅填 head 的 IP（1个条目），使 n_nodes=1 → tensor_parallel_size=device_count=1
-          # dp_deployment 模式不使用 NODE_IPS 进行分布式通信（依赖 MASTER_IP:13355）
-          value: "7.6.52.148"
+          # 全部节点 IP（Master 根据此列表分发 start_engine 给 Worker）
+          value: "7.6.52.148,7.6.16.150"
         - name: ENGINE
           value: vllm
         - name: DISTRIBUTED_EXECUTOR_BACKEND
@@ -227,15 +227,15 @@ spec:
         - name: DISTRIBUTED
           value: "true"
         - name: MASTER_IP
-          # worker 通过物理 IP 连接到 head：7.6.52.148:13355（.148 物理机 iptables → 172.17.0.3:13355）
+          # 指向 head 节点物理 IP，用于角色判定和 RPC 通信
           value: "7.6.52.148"
         - name: RANK_IP
           valueFrom:
             fieldRef:
               fieldPath: status.podIP
-        # NODE_IPS 只填本节点 IP → n_nodes=1 → TP=device_count=1
         - name: NODE_IPS
-          value: "7.6.16.150"
+          # 全部节点 IP（与 head 保持一致，Master 按序号分配 node_rank）
+          value: "7.6.52.148,7.6.16.150"
         - name: ENGINE
           value: vllm
         - name: DISTRIBUTED_EXECUTOR_BACKEND

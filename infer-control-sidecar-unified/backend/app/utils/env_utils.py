@@ -320,6 +320,41 @@ def get_config_force_env():
     return config_force
 
 
+def get_soft_fp4_env():
+    """检查软件 FP4 量化是否启用。
+
+    从 ENABLE_SOFT_FP4 环境变量读取，判断是否启用 FP4 量化。
+
+    Returns:
+        bool: 启用返回 True，未设置或为 'false' 时返回 False
+    """
+    soft_fp4 = os.getenv('ENABLE_SOFT_FP4', 'false')
+    soft_fp4 = soft_fp4.lower() == 'true'
+    return soft_fp4
+
+
+def get_speculative_decoding_env():
+    """获取推测解码是否开启环境变量。
+
+    Returns:
+        bool: 返回 SD_ENABLE 环境变量的值，如果未设置则返回 False
+    """
+    speculative_enable = os.getenv('SD_ENABLE', 'false')
+    speculative_enable = speculative_enable.lower() == 'true'
+    return speculative_enable
+
+
+def get_sparse_env():
+    """获取稀疏 KV 是否开启环境变量。
+
+    Returns:
+        bool: 返回 SPARSE_ENABLE 环境变量的值，如果未设置则返回 False
+    """
+    sparse_enable = os.getenv('SPARSE_ENABLE', 'false')
+    sparse_enable = sparse_enable.lower() == 'true'
+    return sparse_enable
+
+
 def log_kvcache_offload_config(lmcache_offload_enabled, qat_enabled):
     """记录 KVCache Offload 相关配置信息，用于调试和运维排查。
 

@@ -10,9 +10,13 @@
 #   - 模型类型分类: llm/embedding/rerank/mmum/mmgm
 #
 # 支持的模型架构:
-#   - LLM:       DeepseekV3ForCausalLM, Qwen2ForCausalLM, LlamaForCausalLM 等
-#   - MMUM:      Qwen2_5_VLForConditionalGeneration
-#   - Embedding: XLMRobertaModel, BertModel 等
+#   - LLM:       DeepseekV3ForCausalLM, DeepseekV32ForCausalLM,
+#                Glm4ForCausalLM, Glm4MoeForCausalLM,
+#                Qwen2ForCausalLM, Qwen3ForCausalLM, Qwen3MoeForCausalLM,
+#                Qwen3NextForCausalLM, LlamaForCausalLM
+#   - MMUM:      Qwen2_5_VLForConditionalGeneration,
+#                Qwen3VLForConditionalGeneration, Qwen3VLMoeForConditionalGeneration
+#   - Embedding: XLMRobertaModel, BertModel, Qwen3ForCausalLM(Embedding)
 #   - Rerank:    XLMRobertaForSequenceClassification
 #
 # Sidecar 架构契约:
@@ -23,10 +27,13 @@
 # Copyright (c) xFusion Digital Technologies Co., Ltd. 2025-2025. All rights reserved.
 # -*- coding: utf-8 -*-
 
+import logging
 from pathlib import Path
 from typing import Optional
 
 from app.utils.file_utils import load_json_config
+
+logger = logging.getLogger(__name__)
 
 #
 _LLM_MODELS = {
@@ -42,8 +49,14 @@ _LLM_MODELS = {
         "DeepSeek-V3-0324-w8a8",
         "DeepSeek-V3.1-w8a8"
         ],
+    "DeepseekV32ForCausalLM": [
+        "DeepSeek-V3.2-Exp"
+        ],
     "Glm4ForCausalLM": [
         "GLM-4-9B-0414"
+        ],
+    "Glm4MoeForCausalLM": [
+        "GLM-4.7"
         ],
     "Qwen2ForCausalLM": [
         "DeepSeek-R1-Distill-Qwen-1.5B",
@@ -60,6 +73,9 @@ _LLM_MODELS = {
         "Qwen3-30B-A3B",
         "Qwen3-235B-A22B"
         ],
+    "Qwen3NextForCausalLM": [
+        "Qwen3-Next-80B-A3B-Instruct"
+        ],
     "LlamaForCausalLM": [
         "LLaMA3-8B",
         "DeepSeek-R1-Distill-Llama-8B",
@@ -71,6 +87,13 @@ _MMUM_MODELS = {
     "Qwen2_5_VLForConditionalGeneration": [
         "Qwen2.5-VL-7B-Instruct",
         "Qwen2.5-VL-72B-Instruct"
+        ],
+    "Qwen3VLForConditionalGeneration": [
+        "Qwen3-VL-8B-Instruct",
+        "Qwen3-VL-32B-Instruct"
+        ],
+    "Qwen3VLMoeForConditionalGeneration": [
+        "Qwen3-VL-30B-A3B-Instruct"
         ]
 }
 
@@ -178,3 +201,162 @@ class ModelIdentifier:
             return True
         else:
             return False
+
+
+class ModelIdentifierDraft:
+    """草稿模型识别机制"""
+
+    def __init__(self, model_path: str):
+        self.model_path = Path(model_path)
+        self.config = load_json_config(self.model_path / "config.json")
+        self.draft_model_architecture = self.identify_model_architecture()
+        self.model_draft_vocab_size = self.identify_draft_vocab_size()
+
+    def identify_model_architecture(self) -> Optional[str]:
+        """识别模型类型"""
+        architectures = self.config.get("architectures", [])
+        if architectures:
+            return architectures[0]
+        else:
+            return "unknown_architecture"
+
+    def identify_draft_vocab_size(self) -> Optional[bool]:
+        """识别eagle3模型特有特征"""
+        draft_vocab_size = self.config.get("draft_vocab_size", 0)
+        if draft_vocab_size:
+            return True
+        else:
+            return False
+
+
+def is_qwen3_32b_nvfp4(model_path: str) -> bool:
+    """判断模型是否为 Qwen3-32B-NVFP4 模型
+
+    判断标准：
+    1. 模型架构 architectures 为 Qwen3ForCausalLM
+    2. config.json 中没有 quantization_config 字段
+    3. 权重路径下存在 quant_model_description.json 文件
+
+    Args:
+        model_path: 模型权重路径
+
+    Returns:
+        bool: 如果是 Qwen3-32B-NVFP4 模型返回 True，否则返回 False
+    """
+    try:
+        model_path_obj = Path(model_path)
+        config = load_json_config(model_path_obj / "config.json")
+
+        architectures = config.get("architectures", [])
+        if not architectures or architectures[0] != "Qwen3ForCausalLM":
+            logger.warning(f"is_qwen3_32b_nvfp4: architectures check failed"
+                           " - architectures={architectures}, expected=['Qwen3ForCausalLM']")
+            return False
+
+        if "quantization_config" in config:
+            logger.warning(f"is_qwen3_32b_nvfp4: quantization_config check failed"
+                           " - quantization_config exists in config.json")
+            return False
+
+        quant_model_desc_path = model_path_obj / "quant_model_description.json"
+        if not quant_model_desc_path.exists():
+            logger.warning(f"is_qwen3_32b_nvfp4: quant_model_description.json check failed"
+                           " - file not found at {quant_model_desc_path}")
+            return False
+
+        return True
+
+    except Exception as e:
+        logger.warning(f"Failed to check if model is Qwen3-32B-NVFP4: {e}")
+        return False
+
+
+def is_deepseek_series_fp8(model_path: str) -> bool:
+    """判断模型是否为 DeepSeek 系列 FP8 模型
+
+    判断标准：
+    1. 模型架构 architectures 为 DeepseekV3ForCausalLM
+    2. config.json 中没有 quantization_config 字段
+    3. 权重路径下存在 quant_model_description.json 文件
+
+    Args:
+        model_path: 模型权重路径
+
+    Returns:
+        bool: 如果是 DeepSeek 系列 FP8 模型返回 True，否则返回 False
+    """
+    try:
+        model_path_obj = Path(model_path)
+        config = load_json_config(model_path_obj / "config.json")
+
+        architectures = config.get("architectures", [])
+        if not architectures or architectures[0] != "DeepseekV3ForCausalLM":
+            logger.warning(f"is_deepseek_series_fp8: architectures check failed"
+                           " - architectures={architectures}, expected=['DeepseekV3ForCausalLM']")
+            return False
+
+        if "quantization_config" in config:
+            logger.warning(f"is_deepseek_series_fp8: quantization_config check failed"
+                           " - quantization_config exists in config.json")
+            return False
+
+        quant_model_desc_path = model_path_obj / "quant_model_description.json"
+        if not quant_model_desc_path.exists():
+            logger.warning(f"is_deepseek_series_fp8: quant_model_description.json check failed"
+                           " - file not found at {quant_model_desc_path}")
+            return False
+
+        return True
+
+    except Exception as e:
+        logger.warning(f"Failed to check if model is DeepSeek series FP8: {e}")
+        return False
+
+
+def is_qwen3_series_fp8(model_path: str, model_name: str) -> bool:
+    """判断模型是否为 Qwen3 系列 FP8 模型
+
+    判断标准：
+    1. 模型架构为 Qwen3ForCausalLM 或 Qwen3MoeForCausalLM
+    2. 如果是 Qwen3MoeForCausalLM，则模型名称中不包含 '235'
+    3. config.json 中没有 quantization_config 字段
+    4. 权重路径下存在 quant_model_description.json 文件
+
+    Args:
+        model_path: 模型权重路径
+        model_name: 模型名称
+
+    Returns:
+        bool: 如果是 Qwen3 系列 FP8 模型返回 True，否则返回 False
+    """
+    try:
+        model_path_obj = Path(model_path)
+        config = load_json_config(model_path_obj / "config.json")
+
+        architectures = config.get("architectures", [])
+        if not architectures:
+            logger.warning(f"is_qwen3_series_fp8: architectures check failed - architectures is empty")
+            return False
+
+        is_qwen3 = architectures[0] == "Qwen3ForCausalLM"
+        is_qwen3_moe = architectures[0] == "Qwen3MoeForCausalLM" and '235' not in model_name
+
+        if not is_qwen3 and not is_qwen3_moe:
+            return False
+
+        if "quantization_config" in config:
+            logger.warning(f"is_qwen3_series_fp8: quantization_config check failed"
+                           " - quantization_config exists in config.json")
+            return False
+
+        quant_model_desc_path = model_path_obj / "quant_model_description.json"
+        if not quant_model_desc_path.exists():
+            logger.warning(f"is_qwen3_series_fp8: quant_model_description.json check failed"
+                           " - file not found at {quant_model_desc_path}")
+            return False
+
+        return True
+
+    except Exception as e:
+        logger.warning(f"Failed to check if model is Qwen3 series FP8: {e}")
+        return False

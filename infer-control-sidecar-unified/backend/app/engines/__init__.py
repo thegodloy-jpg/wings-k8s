@@ -13,6 +13,11 @@
 #   - mindie_adapter.py —— MindIE（华为昇腾）引擎适配器
 #                          生成 config.json 合并脚本 + mindieservice_daemon 启动命令
 #                          支持单节点 TP 和多节点 DP 模式
+#   - wings_adapter.py  —— Wings 多模态引擎适配器 (v2 新增)
+#                          支持 HunyuanVideo 文生视频、QwenImage 文生图、
+#                          Transformers LLM 服务
+#   - xllm_adapter.py   —— XLLM 华为昇腾原生引擎适配器 (v2 新增)
+#                          支持单节点和多节点部署
 #
 # 适配器接口契约:
 #   - build_start_script(params) -> str  : 返回完整 bash 脚本体（不含 shebang）
@@ -25,6 +30,6 @@
 # -----------------------------------------------------------------------------
 """推理引擎适配器包。
 
-包含 vLLM、SGLang、MindIE 等引擎的启动命令生成适配器，
+包含 vLLM、SGLang、MindIE、Wings、XLLM 等引擎的启动命令生成适配器，
 负责将统一参数格式转换为引擎专属的启动脚本。
 """

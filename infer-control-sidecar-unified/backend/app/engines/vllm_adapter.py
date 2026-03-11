@@ -55,7 +55,7 @@ import re
 import shlex
 from typing import Dict, Any, List
 
-from app.utils.model_utils import ModelIdentifier
+from app.utils.model_utils import ModelIdentifier, ModelIdentifierDraft, is_deepseek_series_fp8
 
 from app.utils.env_utils import get_local_ip, get_lmcache_env, \
     get_pd_role_env, get_qat_env
@@ -119,6 +119,17 @@ def _build_base_env_commands(params, engine: str, root: str) -> List[str]:
         if params.get("engine_config", {}).get("use_kunlun_atb"):
             env_commands.append(f"export USE_KUNLUN_ATB=1")
             logger.info("kunlun atb is used")
+        # Qwen3NextForCausalLM 需要 bisheng_toolkit 环境
+        model_info = ModelIdentifier(
+            params.get("model_name"),
+            params.get("model_path"),
+            params.get("model_type")
+        )
+        if model_info.model_architecture == "Qwen3NextForCausalLM":
+            env_commands.append(
+                "source /usr/local/Ascend/ascend-toolkit/8.3.RC2/bisheng_toolkit/set_env.sh"
+            )
+            logger.info("Qwen3NextForCausalLM will source bisheng_toolkit")
     return env_commands
 
 
@@ -147,12 +158,17 @@ def _build_cache_env_commands(engine: str) -> List[str]:
     if not get_lmcache_env():
         return env_commands
 
+    # 跨实例Hash一致
+    env_commands.append('export PYTHONHASHSEED=0')
+
     if engine == "vllm":
-        #  kv_agent
+        #  kv_agent + sparse
         lib_path = _sanitize_shell_path(os.getenv("KV_AGENT_LIB_PATH", "/opt/vllm_env/lib/python3.10/site-packages/kv_agent/lib"))
+        sparse_lib_path = _sanitize_shell_path(os.getenv("SPARSE_LIB_PATH", "/opt/vllm_env/lib/python3.10/site-packages/vsparse/native"))
         env_commands.append(f'_KV_LIB_PATH={lib_path}')
-        env_commands.append('export LD_LIBRARY_PATH="${_KV_LIB_PATH}:${LD_LIBRARY_PATH:-}"')
-        logger.info("[KVCache Offload] Added LD_LIBRARY_PATH for vllm: %s", lib_path)
+        env_commands.append(f'_SPARSE_LIB_PATH={sparse_lib_path}')
+        env_commands.append('export LD_LIBRARY_PATH="${_KV_LIB_PATH}:${_SPARSE_LIB_PATH}:${LD_LIBRARY_PATH:-}"')
+        logger.info("[KVCache Offload] Added LD_LIBRARY_PATH for vllm: %s, %s", lib_path, sparse_lib_path)
     elif engine == "vllm_ascend":
         #  lmcache
         lib_path = _sanitize_shell_path(os.getenv("LMCACHE_LIB_PATH", "/opt/ascend_env/lib/python3.11/site-packages/lmcache"))
@@ -271,6 +287,93 @@ def _build_distributed_env_commands(params: Dict[str, Any], current_ip: str,
     return []
 
 
+def _build_deepseek_fp8_env_commands(params: Dict[str, Any], engine: str) -> List[str]:
+    """构建 DeepSeek FP8 模型所需的环境变量命令。
+
+    仅在满足以下条件时设置 DeepSeek FP8 专属环境变量：
+    1. 引擎类型为 vllm_ascend
+    2. 模型路径存在
+    3. 模型是 DeepSeek 系列 FP8 模型
+
+    Args:
+        params: 参数字典，包含 model_path 等信息
+        engine: 引擎类型
+
+    Returns:
+        List[str]: 环境变量导出命令列表
+    """
+    env_commands = []
+    model_path = params.get("model_path")
+
+    if engine == "vllm_ascend" and model_path and is_deepseek_series_fp8(model_path):
+        env_commands.extend([
+            "export VLLM_ASCEND_ENABLE_NZ=0",
+            "export HCCL_OP_EXPANSION_MODE=AIV",
+            "export VLLM_ASCEND_ENABLE_MLAPO=1",
+            "export VLLM_ASCEND_BALANCE_SCHEDULING=1"
+        ])
+        logger.info("[DeepSeek FP8] Set environment variables for DeepSeek FP8 model")
+
+    return env_commands
+
+
+def _build_ascend910_9362_env_commands(params: Dict[str, Any], engine: str) -> List[str]:
+    """构建 Ascend910_9362 设备特定环境变量命令。
+
+    当满足以下条件时，添加特定的环境变量：
+    1. 通过 torch_npu 检测设备名称为 Ascend910_9362
+    2. 模型结构为 DeepseekV32ForCausalLM 或 DeepseekV3ForCausalLM
+    3. 引擎为 vllm_ascend
+    4. 不是 dp_deployment 分布式模式（避免与 _build_distributed_env_commands 重复）
+
+    Args:
+        params: 参数字典
+        engine: 引擎类型
+
+    Returns:
+        List[str]: 环境变量导出命令列表
+    """
+    env_commands = []
+    distributed_backend = params.get("distributed_executor_backend")
+
+    # 通过 torch_npu 获取设备名称
+    device_name = None
+    try:
+        import torch_npu
+        device_name = torch_npu.npu.get_device_name(0)
+        logger.info(f"[Ascend910_9362] Detected device: {device_name}")
+    except Exception as e:
+        logger.warning(f"[Ascend910_9362] Failed to get device name via torch_npu: {e}")
+
+    if device_name != "Ascend910_9362":
+        return env_commands
+
+    if engine != "vllm_ascend":
+        return env_commands
+
+    if distributed_backend == "dp_deployment":
+        return env_commands
+
+    if not params.get("model_path"):
+        return env_commands
+
+    model_info = ModelIdentifier(
+        params.get("model_name"),
+        params.get("model_path"),
+        params.get("model_type")
+    )
+
+    if model_info.model_architecture in ["DeepseekV32ForCausalLM", "DeepseekV3ForCausalLM"]:
+        env_commands.extend([
+            "export OMP_PROC_BIND=false",
+            "export OMP_NUM_THREADS=10",
+            "export HCCL_BUFFSIZE=1024"
+        ])
+        logger.info(f"[Ascend910_9362] Set environment variables for {model_info.model_architecture}")
+
+    return env_commands
+
+
 def _build_env_commands(params: Dict[str, Any], current_ip: str, network_interface: str, root: str) -> List[str]:
     """组装完整的环境变量设置命令列表。
 
@@ -298,6 +401,8 @@ def _build_env_commands(params: Dict[str, Any], current_ip: str, network_interfa
     env_commands.extend(_build_qat_env_commands(engine))
     env_commands.extend(_build_pd_role_env_commands(engine, current_ip, network_interface))
     env_commands.extend(_build_distributed_env_commands(params, current_ip, network_interface, engine))
+    env_commands.extend(_build_deepseek_fp8_env_commands(params, engine))
+    env_commands.extend(_build_ascend910_9362_env_commands(params, engine))
 
     return env_commands
 
@@ -373,6 +478,143 @@ def _build_vllm_cmd_parts(params: Dict[str, Any]) -> str:
             cmd_parts.extend([arg_name, str(value)])
 
     return " ".join(cmd_parts)
+
+
+# ── 推测解码 (Speculative Decoding) ──────────────────────────────────────
+
+def _handle_draft_model_case(params: Dict[str, Any], config: List[str]) -> None:
+    """处理有草稿模型的推测解码配置"""
+    config.append(f'"model": "{params.get("speculative_decode_model_path")}"')
+    config.append('"draft_tensor_parallel_size": 1')
+    draft_model_info = ModelIdentifierDraft(params.get("speculative_decode_model_path"))
+
+    if 'eagle3' in draft_model_info.draft_model_architecture.lower():
+        logger.info('--- Using the Eagle3 speculative decoding approach ---')
+        config.append('"method" : "eagle3"')
+        config.append('"num_speculative_tokens": 3')
+    else:
+        logger.info('--- Using the draft model speculative decoding approach ---')
+        config.append('"method" : "draft_model"')
+        config.append('"num_speculative_tokens": 5')
+        config.append('"disable_padded_drafter_batch": true')
+
+
+def _handle_mtp_case(model_info: ModelIdentifier, mtp_support_models: List[Any],
+                     mtp_types: List[str], config: List[str]) -> None:
+    """处理 MTP 推测解码配置"""
+    logger.info('--- Using the MTP speculative decoding approach ---')
+
+    for i, model_group in enumerate(mtp_support_models):
+        if model_info.model_architecture in model_group:
+            config.append(f'"method": "{mtp_types[i]}"')
+            break
+    config.append('"num_speculative_tokens": 1')
+
+
+def _handle_suffix_case(config: List[str]) -> None:
+    """处理 suffix 推测解码配置"""
+    logger.info('--- Using the suffix speculative decoding approach ---')
+    config.append('"method" : "suffix"')
+    config.append('"num_speculative_tokens": 5')
+    config.append('"suffix_decoding_max_cached_requests": 1000')
+
+
+def _build_speculative_cmd(params: Dict[str, Any], engine: str) -> str:
+    """推测解码方案的自动选取。
+
+    根据模型架构自动选择最优的推测解码策略：
+    1. 如有草稿模型 → eagle3 / draft_model
+    2. Qwen3NextForCausalLM + vllm_ascend → suffix
+    3. DeepSeek/Qwen3Next/Glm4Moe → MTP
+    4. 其他 → suffix
+
+    Args:
+        params: 参数字典
+        engine: 引擎类型 ('vllm' 或 'vllm_ascend')
+
+    Returns:
+        str: --speculative-config 参数字符串，未启用时返回空字符串
+    """
+    model_info = ModelIdentifier(params.get("model_name"),
+                                 params.get("model_path"),
+                                 params.get("model_type"))
+    mtp_types = [
+        "deepseek_mtp",
+        "qwen3_next_mtp",
+        "glm4_moe_mtp",
+    ]
+    mtp_support_models = [
+        ["DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM"],
+        ["Qwen3NextForCausalLM"],
+        ["Glm4MoeForCausalLM"]
+    ]
+
+    speculative_config_temp = []
+
+    if engine not in ("vllm", "vllm_ascend"):
+        return ""
+
+    if params.get("speculative_decode_model_path"):
+        _handle_draft_model_case(params, speculative_config_temp)
+        return " --speculative-config '{" + ", ".join(speculative_config_temp) + "}'"
+
+    # Qwen3NextForCausalLM + vllm_ascend 使用 suffix
+    if model_info.model_architecture == "Qwen3NextForCausalLM" and engine == "vllm_ascend":
+        _handle_suffix_case(speculative_config_temp)
+        return " --speculative-config '{" + ", ".join(speculative_config_temp) + "}'"
+
+    if any(model_info.model_architecture in group for group in mtp_support_models):
+        _handle_mtp_case(model_info, mtp_support_models, mtp_types, speculative_config_temp)
+        return " --speculative-config '{" + ", ".join(speculative_config_temp) + "}'"
+
+    _handle_suffix_case(speculative_config_temp)
+    return " --speculative-config '{" + ", ".join(speculative_config_temp) + "}'"
+
+
+# ── Sparse KV ────────────────────────────────────────────────────────────
+
+def _build_sparse_config(params: Dict[str, Any], config: List[str]) -> str:
+    """构建 sparse-config 参数"""
+    config.append('"enable_sparse": true')
+    config.append('"sparse_algo_type": "BMSA"')
+    config.append(f'"lc_sparse_threshold": {params.get("lc_sparse_threshold")}')
+    config.append(f'"total_budget": {params.get("total_budget")}')
+    return " --sparse-config '{" + ", ".join(config) + "}'"
+
+
+def _build_kv_transfer_config(params: Dict[str, Any], config: List[str]) -> str:
+    """构建 kv-transfer-config 参数"""
+    config.append('"kv_connector" : "SparseConnector"')
+    config.append('"kv_role" : "kv_both"')
+    config.append('"kv_connector_module_path": "vsparse.connectors.sparse_connector"')
+    config.append(
+        '"kv_connector_extra_config": {"sparse_connectors": '
+        '[{"connector_name": "LocalStoreKVStore", "connector_config": {'
+        f'"capacity": {params.get("local_kvstore_capacity")}'
+        '}}]}')
+    return " --kv-transfer-config '{" + ", ".join(config) + "}'"
+
+
+def _build_sparse_cmd(params: Dict[str, Any], engine: str) -> str:
+    """构建 Sparse KV 完整命令参数。
+
+    仅 vllm (NVIDIA) 支持 Sparse KV 特性。
+    当前 SparseKV 不兼容 CUDA Graph，需追加 --enforce-eager。
+
+    Args:
+        params: 参数字典
+        engine: 引擎类型
+
+    Returns:
+        str: sparse-config + kv-transfer-config + --enforce-eager，未启用时返回空字符串
+    """
+    if engine not in ("vllm",):
+        return ""
+    config_sparse_tmp = []
+    config_sparse = _build_sparse_config(params, config_sparse_tmp)
+    config_kv_transfer_tmp = []
+    config_kv_transfer = _build_kv_transfer_config(params, config_kv_transfer_tmp)
+    return config_sparse + config_kv_transfer + " --enforce-eager"
 
 
 def _build_vllm_command(params: Dict[str, Any]) -> str:
@@ -495,8 +737,18 @@ def build_start_script(params: Dict[str, Any]) -> str:
     # 其次环境变量，最后回退到 28020（与 wings 对齐）
     ray_port = str(params.get("ray_head_port", os.getenv("RAY_PORT", "28020")))
 
+    # ── 公共环境命令链（对齐 A 的 _build_env_commands 调用链） ─────────
+    # sidecar 容器无 GPU/NPU，使用环境变量代替 netifaces 探测网络接口
+    current_ip = os.getenv("POD_IP", get_local_ip())
+    net_if = os.getenv("NETWORK_INTERFACE", os.getenv("GLOO_SOCKET_IFNAME", "eth0"))
+    common_env_cmds: List[str] = []
+    common_env_cmds.extend(_build_base_env_commands(params, engine, root_dir))
+    common_env_cmds.extend(_build_cache_env_commands(engine))
+    common_env_cmds.extend(_build_qat_env_commands(engine))
+    common_env_cmds.extend(_build_pd_role_env_commands(engine, current_ip, net_if))
+
     if is_distributed and nnodes > 1:
-        script_parts = []
+        script_parts = list(common_env_cmds)
         is_ascend = (engine == "vllm_ascend")
 
         if backend == "ray":
@@ -582,8 +834,12 @@ def build_start_script(params: Dict[str, Any]) -> str:
                     # Detect default-route interface from /proc/net/route
                     # (ip command unavailable in vllm-ascend image; awk is universally present)
                     script_parts.append("export HCCL_SOCKET_IFNAME=$(awk '$2==\"00000000\"{print $1;exit}' /proc/net/route 2>/dev/null || echo eth0)")
+                    script_parts.append("export TP_SOCKET_IFNAME=$(awk '$2==\"00000000\"{print $1;exit}' /proc/net/route 2>/dev/null || echo eth0)")
+                    script_parts.append("export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1")
+                    script_parts.append("export ASCEND_PROCESS_LOG_PATH=/tmp/ray_vllm010")
                 else:
                     script_parts.append(f"export NCCL_SOCKET_IFNAME={os.getenv('NCCL_SOCKET_IFNAME', 'eth0')}")
+                    script_parts.append(f"export TP_SOCKET_IFNAME={os.getenv('NCCL_SOCKET_IFNAME', 'eth0')}")
                 script_parts.append("export GLOO_SOCKET_IFNAME=$(awk '$2==\"00000000\"{print $1;exit}' /proc/net/route 2>/dev/null || echo eth0)\n")
                 # Ascend: use --resources='{"NPU": 1}' instead of --num-gpus=1
                 # vllm-ascend v0.14.0rc1 requires NPU resource in Ray cluster, not GPU
@@ -597,7 +853,25 @@ def build_start_script(params: Dict[str, Any]) -> str:
                 # Ascend: --enforce-eager bypasses Triton compilation
                 # (vllm-ascend v0.14.0rc1 Triton NPU driver detection fails in k3s containers)
                 eager_flag = " --enforce-eager" if is_ascend else ""
-                script_parts.append(f"exec {cmd}{eager_flag} --distributed-executor-backend ray")
+                # 推测解码 & Sparse KV
+                speculative_extra = ""
+                sparse_extra = ""
+                if params.get("enable_speculative_decode"):
+                    speculative_extra = _build_speculative_cmd(params, engine)
+                if params.get("enable_sparse"):
+                    sparse_extra = _build_sparse_cmd(params, engine)
+                # Qwen3MoeForCausalLM pipeline-parallel 支持
+                ray_pp_extra = ""
+                model_info_ray = ModelIdentifier(
+                    params.get("model_name"), params.get("model_path"), params.get("model_type"))
+                if getattr(model_info_ray, "model_architecture", None) == "Qwen3MoeForCausalLM":
+                    nodes_list = node_ips.split(",") if node_ips else []
+                    num_nodes = len(nodes_list) if nodes_list else 1
+                    tp_size = params.get("device_count", 1)
+                    ray_pp_extra = f" --pipeline-parallel-size {num_nodes} --tensor-parallel-size {tp_size}"
+                    logger.info(f"[vllm_ascend ray] Set parallel parameters: "
+                                f"pipeline_parallel_size={num_nodes}, tensor_parallel_size={tp_size}")
+                script_parts.append(f"exec {cmd}{eager_flag}{speculative_extra}{sparse_extra}{ray_pp_extra} --distributed-executor-backend ray")
             else:
                 if is_ascend:
                     script_parts.append("export HCCL_WHITELIST_DISABLE=1")
@@ -621,10 +895,14 @@ def build_start_script(params: Dict[str, Any]) -> str:
                     # Set HCCL env using discovered head IP
                     script_parts.append(f"export HCCL_IF_IP=$(python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(('$HEAD_IP',{ray_port})); print(s.getsockname()[0]); s.close()\" 2>/dev/null || hostname -i)")
                     script_parts.append("export HCCL_SOCKET_IFNAME=$(awk '$2==\"00000000\"{print $1;exit}' /proc/net/route 2>/dev/null || echo eth0)")
+                    script_parts.append("export TP_SOCKET_IFNAME=$(awk '$2==\"00000000\"{print $1;exit}' /proc/net/route 2>/dev/null || echo eth0)")
+                    script_parts.append("export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1")
+                    script_parts.append("export ASCEND_PROCESS_LOG_PATH=/tmp/ray_vllm010")
                     # Worker also needs VLLM_HOST_IP for Ray node matching
                     script_parts.append("export VLLM_HOST_IP=${POD_IP:-$(python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));print(s.getsockname()[0]);s.close()\" 2>/dev/null || hostname -i)}")
                 else:
                     script_parts.append(f"export NCCL_SOCKET_IFNAME={os.getenv('NCCL_SOCKET_IFNAME', 'eth0')}")
+                    script_parts.append(f"export TP_SOCKET_IFNAME={os.getenv('NCCL_SOCKET_IFNAME', 'eth0')}")
                     # Worker's own routable IP (for Ray node-ip-address)
                     script_parts.append("export VLLM_HOST_IP=${POD_IP:-$(python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));print(s.getsockname()[0]);s.close()\" 2>/dev/null || hostname -i)}")
                     script_parts.append("for i in $(seq 1 60); do")
@@ -706,9 +984,25 @@ def build_start_script(params: Dict[str, Any]) -> str:
             "|| echo 'WARN: nnal/atb/set_env.sh not found'\n"
             "set -u\n"
         )
-        return env_block + f"exec {cmd}\n"
+        env_prefix = "\n".join(common_env_cmds) + "\n" if common_env_cmds else ""
+        # 单机模式：推测解码 & Sparse KV
+        speculative_extra = ""
+        sparse_extra = ""
+        if params.get("enable_speculative_decode"):
+            speculative_extra = _build_speculative_cmd(params, engine)
+        if params.get("enable_sparse"):
+            sparse_extra = _build_sparse_cmd(params, engine)
+        return env_prefix + env_block + f"exec {cmd}{speculative_extra}{sparse_extra}\n"
 
-    return f"exec {cmd}\n"
+    env_prefix = "\n".join(common_env_cmds) + "\n" if common_env_cmds else ""
+    # 单机模式：推测解码 & Sparse KV
+    speculative_extra = ""
+    sparse_extra = ""
+    if params.get("enable_speculative_decode"):
+        speculative_extra = _build_speculative_cmd(params, engine)
+    if params.get("enable_sparse"):
+        sparse_extra = _build_sparse_cmd(params, engine)
+    return env_prefix + f"exec {cmd}{speculative_extra}{sparse_extra}\n"
 
 
 def start_vllm_distributed(params: Dict):

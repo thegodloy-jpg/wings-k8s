@@ -25,6 +25,7 @@
 # Copyright (c) xFusion Digital Technologies Co., Ltd. 2025-2025. All rights reserved.
 
 import os
+import subprocess
 from typing import List, Dict, Literal, Union, Any
 import logging
 
@@ -443,3 +444,75 @@ def is_h20_gpu(total_memory: float, tolerance_gb: float = 10.0) -> str:
     elif abs(total_memory - 141) <= tolerance_gb:
         return "H20-141G"
     return ""
+
+
+def check_pcie_cards(device_id="d802", subsystem_id="4000"):
+    """检查指定的device_id,subsystem_id的pcie设备是否存在
+
+    Args:
+        device_id (str): 要查找的目标设备ID，默认值为"d802"
+        subsystem_id (str): 要匹配的目标子系统ID，默认值为"4000"
+
+    Returns:
+        tuple: (is_exist, count, bdf_list) - 设备是否存在、总数和BDF列表
+        - is_exist (bool): 如果找到至少一个匹配设备则返回True
+        - count (int): 匹配设备的总数量
+        - bdf_list (list): 匹配设备的BDF地址列表
+
+    其他:
+        常用的device id/subsystem id 与设备对应关系
+        d500/0110  300I Pro标卡
+        d500/0100  300I Duo标卡
+        d802/3000  910B4 模组
+        d802/3005  910B4-1 模组
+        d802/4000  300I A2标卡
+        d803/3003  Ascend910 (910C模组)
+    """
+    try:
+        result = subprocess.run(
+            ['/usr/bin/lspci', '-d', f':{device_id}'],
+            capture_output=True, text=True, check=True
+        )
+
+        if not result.stdout.strip():
+            return False, 0, []
+
+        device_bdfs = []
+        for line in result.stdout.strip().split('\n'):
+            if line and ':' in line:
+                bdf = line.split()[0]
+                device_bdfs.append(bdf)
+
+        count = 0
+        matched_bdfs = []
+        for bdf in device_bdfs:
+            detail_result = subprocess.run(
+                ['/usr/bin/lspci', '-vvv', '-s', bdf],
+                capture_output=True, text=True, check=True
+            )
+            if f'Device {subsystem_id}' in detail_result.stdout:
+                count += 1
+                matched_bdfs.append(bdf)
+
+        return count > 0, count, matched_bdfs
+
+    except subprocess.CalledProcessError as e:
+        error_msg = str(e)
+        if "command not found" in error_msg or "No such file or directory" in error_msg:
+            logger.error("lspci command is not available")
+            return False, 0, []
+        else:
+            logger.error(f"Command execution failed: {error_msg}")
+            return False, 0, []
+
+    except FileNotFoundError:
+        logger.error("lspci command not found")
+        return False, 0, []
+
+    except ValueError as e:
+        logger.error(f"Result parsing failed: {str(e)}")
+        return False, 0, []
+
+    except Exception as e:
+        logger.error(f"Unexpected error occurred: {str(e)}")
+        return False, 0, []

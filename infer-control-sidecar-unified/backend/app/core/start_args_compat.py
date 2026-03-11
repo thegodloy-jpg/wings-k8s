@@ -120,6 +120,10 @@ class LaunchArgs:
         speculative_decode_model_path: 推测解码小模型路径
         enable_rag_acc: 是否启用 RAG 加速
         enable_auto_tool_choice: 是否自动选择工具调用
+        enable_sparse:  是否启用 Sparse KV Cache (v2 新增)
+        lc_sparse_threshold: LC Sparse 阈值 (v2 新增)
+        total_budget:   KV Cache 预算 (v2 新增)
+        local_kvstore_capacity: 本地 KVStore 容量 (v2 新增)
         distributed:    是否启用多节点分布式推理
         nnodes:         分布式节点总数
         node_rank:      当前节点编号（0 为 head 节点）
@@ -156,6 +160,10 @@ class LaunchArgs:
     speculative_decode_model_path: str
     enable_rag_acc: bool
     enable_auto_tool_choice: bool
+    enable_sparse: bool
+    lc_sparse_threshold: float
+    total_budget: int
+    local_kvstore_capacity: int
     distributed: bool
     nnodes: int
     node_rank: int
@@ -206,6 +214,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--speculative-decode-model-path", default=_env("SPECULATIVE_DECODE_MODEL_PATH", ""))
     _add_bool(p, "--enable-rag-acc", "ENABLE_RAG_ACC", False)
     _add_bool(p, "--enable-auto-tool-choice", "ENABLE_AUTO_TOOL_CHOICE", False)
+
+    # --- v2 新增: Sparse KV / KVStore 参数 ---
+    _add_bool(p, "--enable-sparse", "ENABLE_SPARSE", False)
+    p.add_argument("--lc-sparse-threshold", type=float, default=_env_float("LC_SPARSE_THRESHOLD", 0.0))
+    p.add_argument("--total-budget", type=int, default=_env_int("TOTAL_BUDGET", 0))
+    p.add_argument("--local-kvstore-capacity", type=int, default=_env_int("LOCAL_KVSTORE_CAPACITY", 0))
+
     _add_bool(p, "--distributed", "DISTRIBUTED", False)
 
     p.add_argument("--nnodes", type=int, default=_env_int("NNODES", 1))
@@ -216,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 # 支持的推理引擎白名单；不在此集合中的 engine 值将被 parse_launch_args 拒绝
-SUPPORTED_ENGINES = {"vllm", "vllm_ascend", "sglang", "mindie", "wings"}
+SUPPORTED_ENGINES = {"vllm", "vllm_ascend", "sglang", "mindie", "wings", "xllm"}
 
 
 def parse_launch_args(argv: list[str] | None = None) -> LaunchArgs:
@@ -277,6 +292,10 @@ def parse_launch_args(argv: list[str] | None = None) -> LaunchArgs:
         speculative_decode_model_path=args.speculative_decode_model_path,
         enable_rag_acc=bool(args.enable_rag_acc),
         enable_auto_tool_choice=bool(args.enable_auto_tool_choice),
+        enable_sparse=bool(args.enable_sparse),
+        lc_sparse_threshold=float(args.lc_sparse_threshold),
+        total_budget=int(args.total_budget),
+        local_kvstore_capacity=int(args.local_kvstore_capacity),
         distributed=bool(args.distributed),
         nnodes=int(args.nnodes),
         node_rank=int(args.node_rank),

@@ -456,6 +456,8 @@ def build_start_script(params: Dict[str, Any]) -> str:
             params[key] = engine_config[key]
 
     # ── 1. npuDeviceIds ────────────────────────────────────────────────────
+    # 分布式默认 8 卡 [[0..7]]，单机默认 [[0]]（对齐 A）
+    npu_default = [[0, 1, 2, 3, 4, 5, 6, 7]] if is_distributed else [[0]]
     npu_device_ids = engine_config.get("npuDeviceIds", None)
     if npu_device_ids is None:
         npu_ids_env = os.getenv("MINDIE_NPU_DEVICE_IDS", "")
@@ -463,10 +465,10 @@ def build_start_script(params: Dict[str, Any]) -> str:
             try:
                 npu_device_ids = json.loads(npu_ids_env)
             except (json.JSONDecodeError, ValueError):
-                logger.warning("MINDIE_NPU_DEVICE_IDS parse error: %s, fallback to [[0]]", npu_ids_env)
-                npu_device_ids = [[0]]
+                logger.warning("MINDIE_NPU_DEVICE_IDS parse error: %s, fallback to %s", npu_ids_env, npu_default)
+                npu_device_ids = npu_default
         else:
-            npu_device_ids = [[0]]
+            npu_device_ids = npu_default
 
     # ── 2. ServerConfig overrides ──────────────────────────────────────────
     main_port: int = engine_config.get("port", DEFAULT_SERVER_PORT)
